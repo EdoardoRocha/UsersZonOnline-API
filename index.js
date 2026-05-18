@@ -47,25 +47,28 @@ app.post("/api/v1/presence", async (req, res) => {
 
   try {
     const usuarioAtualizado = await OnlineUser.findOneAndUpdate(
-      { _id }, // 1º: Filtro (busca pelo ID fixo do vendedor)
-      { name, status }, // 2º: Dados para atualizar (juntos no mesmo objeto)
+      { _id },
+      { name, status },
       {
-        upsert: true, // Se não existir, cria um novo documento
-        new: true, // Retorna o documento modificado
-        runValidators: true, // Garante as validações do seu Schema
+        upsert: true,
+        returnDocument: "after",
+        runValidators: true,
       },
     );
 
-    return res
-      .status(200)
-      .json({
-        message: "Status do usuário atualizado com sucesso!",
-        data: usuarioAtualizado,
-      });
+    return res.status(200).json({
+      message: "Status do usuário atualizado com sucesso!",
+      data: usuarioAtualizado,
+    });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: error.message });
   }
+});
+
+app.get("/api/v1/status", async (req, res) => {
+  const usersStatus = await OnlineUser.find();
+  res.status(200).json(usersStatus);
 });
 
 app.listen(process.env.PORT, () => {
