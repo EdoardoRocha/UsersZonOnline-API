@@ -51,8 +51,7 @@ app.post("/api/v1/presence", async (req, res) => {
     if (documentExists) {
       await OnlineUser.findOneAndUpdate(
         { _id },
-        { name },
-        { status },
+        { name, status },
         { returnDocument: "after", runValidators: true },
       );
 
