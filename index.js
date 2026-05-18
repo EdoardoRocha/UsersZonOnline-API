@@ -55,7 +55,7 @@ app.post("/api/v1/presence", async (req, res) => {
         .status(200)
         .json({ message: "Documento de usuários atualizado!" });
     } else {
-      await OnlineUser.create({ _id: id, name, status });
+      await OnlineUser.create({ _id, name, status });
       return res.status(201).json({ message: "Documento de usuários criado!" });
     }
   } catch (error) {
