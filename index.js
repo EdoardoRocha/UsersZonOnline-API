@@ -67,8 +67,18 @@ app.post("/api/v1/presence", async (req, res) => {
 });
 
 app.get("/api/v1/status", async (req, res) => {
-  const usersStatus = await OnlineUser.find();
-  res.status(200).json(usersStatus);
+  try {
+    const users = await OnlineUser.find({}, "_id name status");
+
+    return res.status(200).json(users);
+  } catch (error) {
+    console.error("[ERRO NA ROTA GET]:", error);
+
+    return res.status(500).json({
+      message: "Erro interno no servidor ao buscar status",
+      error: error.message,
+    });
+  }
 });
 
 app.listen(process.env.PORT, () => {
