@@ -37,17 +37,18 @@ const OnlineUser = mongoose.model(
 app.use(express.json());
 app.use(cors());
 
+//Routes
 app.post("/api/v1/presence", async (req, res) => {
-  const { id, name, status } = req.body;
+  const { _id, name, status } = req.body;
 
   try {
-    const documentExists = await OnlineUser.findOne(id);
+    const documentExists = await OnlineUser.findOne({ name });
 
     if (documentExists) {
       await OnlineUser.findOneAndUpdate(
         { name },
         { status },
-        { returnDocument: 'after', runValidators: true },
+        { returnDocument: "after", runValidators: true },
       );
 
       return res
