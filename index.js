@@ -46,22 +46,22 @@ app.post("/api/v1/presence", async (req, res) => {
   const { _id, name, status } = req.body;
 
   try {
-    const documentExists = await OnlineUser.findOne({ name });
+    const usuarioAtualizado = await OnlineUser.findOneAndUpdate(
+      { _id }, // 1º: Filtro (busca pelo ID fixo do vendedor)
+      { name, status }, // 2º: Dados para atualizar (juntos no mesmo objeto)
+      {
+        upsert: true, // Se não existir, cria um novo documento
+        new: true, // Retorna o documento modificado
+        runValidators: true, // Garante as validações do seu Schema
+      },
+    );
 
-    if (documentExists) {
-      await OnlineUser.findOneAndUpdate(
-        { _id },
-        { name, status },
-        { returnDocument: "after", runValidators: true },
-      );
-
-      return res
-        .status(200)
-        .json({ message: "Documento de usuários atualizado!" });
-    } else {
-      await OnlineUser.create({ _id, name, status });
-      return res.status(201).json({ message: "Documento de usuários criado!" });
-    }
+    return res
+      .status(200)
+      .json({
+        message: "Status do usuário atualizado com sucesso!",
+        data: usuarioAtualizado,
+      });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: error.message });
