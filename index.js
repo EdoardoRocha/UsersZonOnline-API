@@ -20,6 +20,10 @@ const OnlineUser = mongoose.model(
   "OnlineUsers",
   new Schema(
     {
+      _id: {
+        type: String,
+        require: true,
+      },
       name: {
         type: String,
       },
@@ -46,6 +50,7 @@ app.post("/api/v1/presence", async (req, res) => {
 
     if (documentExists) {
       await OnlineUser.findOneAndUpdate(
+        { _id },
         { name },
         { status },
         { returnDocument: "after", runValidators: true },
