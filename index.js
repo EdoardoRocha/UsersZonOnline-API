@@ -20,8 +20,13 @@ const OnlineUser = mongoose.model(
   "OnlineUsers",
   new Schema(
     {
-      onlineUsers: {
-        type: Array,
+      name: {
+        type: String,
+      },
+      status: {
+        type: String,
+        enum: ["online", "offline"],
+        default: "offline",
       },
     },
     { timestamps: true },
@@ -32,28 +37,24 @@ const OnlineUser = mongoose.model(
 app.use(express.json());
 app.use(cors());
 
-let usersOnline = [];
-
 app.post("/api/v1/presence", async (req, res) => {
-  usersOnline = req.body.online_users;
-
-  console.log(`[DEBUG] Passou aqui.`);
+  const { id, name, status } = req.body;
 
   try {
-    const documentExists = await OnlineUser.findOne();
+    const documentExists = await OnlineUser.findOne(id);
 
     if (documentExists) {
       await OnlineUser.findOneAndUpdate(
-        {},
-        { onlineUsers: usersOnline },
-        { new: true, runValidators: true },
+        { name },
+        { status },
+        { returnDocument: 'after', runValidators: true },
       );
 
       return res
         .status(200)
         .json({ message: "Documento de usuários atualizado!" });
     } else {
-      await OnlineUser.create({ onlineUsers: usersOnline });
+      await OnlineUser.create({ _id: id, name, status });
       return res.status(201).json({ message: "Documento de usuários criado!" });
     }
   } catch (error) {
