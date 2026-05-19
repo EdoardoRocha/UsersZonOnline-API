@@ -86,57 +86,66 @@ app.get("/api/v1/status", async (req, res) => {
 });
 
 app.post("/api/v1/distribution", async (req, res) => {
-  const leadData =
-    req.body.leads?.add?.[0] ||
-    req.body.leads?.status?.[0] ||
-    req.body.leads?.update?.[0];
+  console.log("=== CONTEÚDO REAL DO BODY ===");
+  console.log(JSON.stringify(req.body, null, 2));
+  console.log("=============================");
 
-  if (!leadData || !leadData.id) {
-    console.log("Webhook recebido, mas não continha dados de um lead válido.");
-    return res
-      .status(400)
-      .json({ message: "Dados do lead não encontrados no body." });
-  }
+  return res.status(200).json({
+    message: "Debug ativo",
+    chegou: req.body,
+  });
 
-  const leadId = leadData.id;
+  // const leadData =
+  //   req.body.leads?.add?.[0] ||
+  //   req.body.leads?.status?.[0] ||
+  //   req.body.leads?.update?.[0];
 
-  // Puxar lista dos usuários online
-  const onlineUsers = await OnlineUser.find({ status: "online" });
-  // Verificar se todos estão offline
-  if (!onlineUsers)
-    return res
-      .status(400)
-      .json({ message: "Nenhum usuário online nesse momento." });
-  // Construir lógico de fila
-  let indexDestination = indexCurrentPointer % onlineUsers.length;
-  const selectedAttendant = onlineUsers[indexDestination];
-  indexCurrentPointer = (indexDestination + 1) % onlineUsers.length;
+  // if (!leadData || !leadData.id) {
+  //   console.log("Webhook recebido, mas não continha dados de um lead válido.");
+  //   return res
+  //     .status(400)
+  //     .json({ message: "Dados do lead não encontrados no body." });
+  // }
 
-  const SUBDOMAIN = process.env.SUBDOMAIN;
-  const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
+  // const leadId = leadData.id;
 
-  //Enviar resposta para o Kommo
-  try {
-    await axios.patch(
-      `https://${SUBDOMAIN}.kommo.com/api/v4/leads/${leadId}`,
-      {
-        responsible_user_id: Number(selectedAttendant._id),
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${ACCESS_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-      },
-    );
+  // // Puxar lista dos usuários online
+  // const onlineUsers = await OnlineUser.find({ status: "online" });
+  // // Verificar se todos estão offline
+  // if (!onlineUsers)
+  //   return res
+  //     .status(400)
+  //     .json({ message: "Nenhum usuário online nesse momento." });
+  // // Construir lógico de fila
+  // let indexDestination = indexCurrentPointer % onlineUsers.length;
+  // const selectedAttendant = onlineUsers[indexDestination];
+  // indexCurrentPointer = (indexDestination + 1) % onlineUsers.length;
 
-    return res
-      .status(200)
-      .json({ message: "Lead atualizado com sucesso no kommo" });
-  } catch (error) {
-    console.error("Erro na distribuição: " + error);
-    return res.status(500).json({ message: error.message });
-  }
+  // const SUBDOMAIN = process.env.SUBDOMAIN;
+  // const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
+
+  // //Enviar resposta para o Kommo
+  // try {
+  //   await axios.patch(
+  //     `https://${SUBDOMAIN}.kommo.com/api/v4/leads/${leadId}`,
+  //     {
+  //       responsible_user_id: Number(selectedAttendant._id),
+  //     },
+  //     {
+  //       headers: {
+  //         Authorization: `Bearer ${ACCESS_TOKEN}`,
+  //         "Content-Type": "application/json",
+  //       },
+  //     },
+  //   );
+
+  //   return res
+  //     .status(200)
+  //     .json({ message: "Lead atualizado com sucesso no kommo" });
+  // } catch (error) {
+  //   console.error("Erro na distribuição: " + error);
+  //   return res.status(500).json({ message: error.message });
+  // }
 });
 
 app.listen(process.env.PORT, () => {
