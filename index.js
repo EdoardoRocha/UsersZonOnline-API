@@ -83,7 +83,7 @@ app.get("/api/v1/status", async (req, res) => {
   }
 });
 
-app.patch("/api/v1/distribution", async (req, res) => {
+app.post("/api/v1/distribution", async (req, res) => {
   console.log(req.body);
 
   // Puxar lista dos usuários online
