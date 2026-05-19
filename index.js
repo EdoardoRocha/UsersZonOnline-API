@@ -4,6 +4,7 @@ import express from "express";
 import mongoose, { Schema } from "mongoose";
 import { EventEmitter } from "events";
 import { type } from "os";
+import axios from "axios";
 
 const app = express();
 EventEmitter.defaultMaxListeners = 20;
@@ -85,6 +86,19 @@ app.get("/api/v1/status", async (req, res) => {
 });
 
 app.post("/api/v1/distribution", async (req, res) => {
+  const leadData =
+    req.body.leads?.add?.[0] ||
+    req.body.leads?.status?.[0] ||
+    req.body.leads?.update?.[0];
+
+  if (!leadData || !leadData.id) {
+    console.log("Webhook recebido, mas não continha dados de um lead válido.");
+    return res
+      .status(400)
+      .json({ message: "Dados do lead não encontrados no body." });
+  }
+
+  const leadId = leadData.id;
 
   // Puxar lista dos usuários online
   const onlineUsers = await OnlineUser.find({ status: "online" });
@@ -98,9 +112,31 @@ app.post("/api/v1/distribution", async (req, res) => {
   const selectedAttendant = onlineUsers[indexDestination];
   indexCurrentPointer = (indexDestination + 1) % onlineUsers.length;
 
-  return res.status(200).json(req.body);
+  const SUBDOMAIN = process.env.SUBDOMAIN;
+  const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 
   //Enviar resposta para o Kommo
+  try {
+    await axios.patch(
+      `https://${SUBDOMAIN}.kommo.com/api/v4/leads/${leadId}`,
+      {
+        responsible_user_id: Number(selectedAttendant._id),
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      },
+    );
+
+    return res
+      .status(200)
+      .json({ message: "Lead atualizado com sucesso no kommo" });
+  } catch (error) {
+    console.error("Erro na distribuição: " + error);
+    return res.status(500).json({ message: error.message });
+  }
 });
 
 app.listen(process.env.PORT, () => {
