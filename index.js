@@ -98,6 +98,9 @@ app.post("/api/v1/distribution", async (req, res) => {
   const selectedAttendant = onlineUsers[indexDestination];
   indexCurrentPointer = (indexDestination + 1) % onlineUsers.length;
 
+  console.log("Dados recebidos do Kommo:", JSON.stringify(req.body, null, 2));
+
+  return res.status(200).json({ success: true });
 
   //Enviar resposta para o Kommo
 });
