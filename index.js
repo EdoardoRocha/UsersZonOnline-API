@@ -8,6 +8,9 @@ import { type } from "os";
 const app = express();
 EventEmitter.defaultMaxListeners = 20;
 
+// Global Variables
+let indexCurrentPointer = 0;
+
 // Conexão
 async function main() {
   await mongoose.connect(process.env.MONGO_URL);
@@ -69,7 +72,6 @@ app.post("/api/v1/presence", async (req, res) => {
 app.get("/api/v1/status", async (req, res) => {
   try {
     const users = await OnlineUser.find({}, "_id name status");
-
     return res.status(200).json(users);
   } catch (error) {
     console.error("[ERRO NA ROTA GET]:", error);
@@ -79,6 +81,25 @@ app.get("/api/v1/status", async (req, res) => {
       error: error.message,
     });
   }
+});
+
+app.patch("/api/v1/distribution", async (req, res) => {
+  console.log(req.body);
+
+  // Puxar lista dos usuários online
+  const onlineUsers = await OnlineUser.find({ status: "online" });
+  // Verificar se todos estão offline
+  if (!onlineUsers)
+    return res
+      .status(400)
+      .json({ message: "Nenhum usuário online nesse momento." });
+  // Construir lógico de fila
+  let indexDestination = indexCurrentPointer % onlineUsers.length;
+  const selectedAttendant = onlineUsers[indexDestination];
+  indexCurrentPointer = (indexDestination + 1) % onlineUsers.length;
+
+
+  //Enviar resposta para o Kommo
 });
 
 app.listen(process.env.PORT, () => {
