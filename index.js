@@ -88,7 +88,7 @@ app.get("/api/v1/status", async (req, res) => {
 app.post("/api/v1/distribution", async (req, res) => {
   const leadData = req.body.talk?.update?.[0];
 
-  if (!talkData || talkData.entity_type !== "lead") {
+  if (!leadData || talkData.entity_type !== "lead") {
     console.log("Webhook recebido, mas não está atrelado a um lead.");
     return res
       .status(200)
