@@ -85,7 +85,6 @@ app.get("/api/v1/status", async (req, res) => {
 });
 
 app.post("/api/v1/distribution", async (req, res) => {
-  console.log(req.body);
 
   // Puxar lista dos usuários online
   const onlineUsers = await OnlineUser.find({ status: "online" });
@@ -99,9 +98,7 @@ app.post("/api/v1/distribution", async (req, res) => {
   const selectedAttendant = onlineUsers[indexDestination];
   indexCurrentPointer = (indexDestination + 1) % onlineUsers.length;
 
-  console.log("Dados recebidos do Kommo:", JSON.stringify(req.body, null, 2));
-
-  return res.status(200).json({ success: true });
+  return res.status(200).json(req.body);
 
   //Enviar resposta para o Kommo
 });
