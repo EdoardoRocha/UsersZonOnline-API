@@ -86,8 +86,6 @@ app.get("/api/v1/status", async (req, res) => {
 });
 
 app.post("/api/v1/distribution", async (req, res) => {
-  res.status(200).json({ message: "Lead atualizado com sucesso no kommo" });
-
   const leadData = req.body.leads?.status?.[0];
 
   if (!leadData) {
@@ -142,7 +140,9 @@ app.post("/api/v1/distribution", async (req, res) => {
     console.error("Erro na distribuição: " + error);
     return res.status(500).json({ message: error.message });
   } finally {
-    return;
+    return res
+      .status(200)
+      .json({ message: "Lead atualizado com sucesso no kommo" });
   }
 });
 
