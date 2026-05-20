@@ -86,9 +86,7 @@ app.get("/api/v1/status", async (req, res) => {
 });
 
 app.post("/api/v1/distribution", async (req, res) => {
-  return res
-    .status(200)
-    .json({ message: "Lead atualizado com sucesso no kommo" });
+  res.status(200).json({ message: "Lead atualizado com sucesso no kommo" });
 
   const leadData = req.body.leads?.status?.[0];
 
@@ -139,9 +137,12 @@ app.post("/api/v1/distribution", async (req, res) => {
         "Erro da API do Kommo:",
         JSON.stringify(error.response.data, null, 2),
       );
+      return;
     }
     console.error("Erro na distribuição: " + error);
     return res.status(500).json({ message: error.message });
+  } finally {
+    return;
   }
 });
 
