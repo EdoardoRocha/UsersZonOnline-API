@@ -129,6 +129,9 @@ app.post("/api/v1/distribution", async (req, res) => {
         },
       },
     );
+    return res
+      .status(200)
+      .json({ message: "Lead atualizado com sucesso no kommo" });
   } catch (error) {
     if (error.response) {
       console.error(
@@ -139,10 +142,6 @@ app.post("/api/v1/distribution", async (req, res) => {
     }
     console.error("Erro na distribuição: " + error);
     return res.status(500).json({ message: error.message });
-  } finally {
-    return res
-      .status(200)
-      .json({ message: "Lead atualizado com sucesso no kommo" });
   }
 });
 
