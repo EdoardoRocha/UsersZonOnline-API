@@ -35,6 +35,7 @@ const OnlineUser = mongoose.model(
         type: String,
         enum: ["online", "offline"],
         default: "offline",
+        index: true,
       },
     },
     { timestamps: true },
@@ -98,7 +99,9 @@ app.post("/api/v1/distribution", async (req, res) => {
   const leadId = leadData.id;
 
   // Puxar lista dos usuários online
-  const onlineUsers = await OnlineUser.find({ status: "online" });
+  const onlineUsers = await OnlineUser.find({ status: "online" }, null, {
+    sort: { createdAt: -1 },
+  });
   // Verificar se todos estão offline
   if (!onlineUsers)
     return res
