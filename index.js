@@ -90,14 +90,14 @@ app.post("/api/v1/distribution", async (req, res) => {
   console.log(req.body);
   console.log(leadData);
 
-  if (!leadData || leadData.entity_type !== "lead") {
+  if (!leadData) {
     console.log("Webhook recebido, mas não está atrelado a um lead.");
     return res
       .status(200)
       .json({ message: "Ignorado: Não é uma atualização de lead." });
   }
 
-  const leadId = leadData.entity_id;
+  const leadId = leadData.id;
 
   // Puxar lista dos usuários online
   const onlineUsers = await OnlineUser.find({ status: "online" });
