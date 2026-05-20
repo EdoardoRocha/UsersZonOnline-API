@@ -86,6 +86,10 @@ app.get("/api/v1/status", async (req, res) => {
 });
 
 app.post("/api/v1/distribution", async (req, res) => {
+  return res
+    .status(200)
+    .json({ message: "Lead atualizado com sucesso no kommo" });
+
   const leadData = req.body.leads?.status?.[0];
 
   if (!leadData) {
@@ -129,10 +133,6 @@ app.post("/api/v1/distribution", async (req, res) => {
         },
       },
     );
-
-    return res
-      .status(200)
-      .json({ message: "Lead atualizado com sucesso no kommo" });
   } catch (error) {
     if (error.response) {
       console.error(
