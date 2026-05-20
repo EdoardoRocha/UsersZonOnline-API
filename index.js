@@ -117,10 +117,13 @@ app.post("/api/v1/distribution", async (req, res) => {
   //Enviar resposta para o Kommo
   try {
     await axios.patch(
-      `https://${SUBDOMAIN}.kommo.com/api/v4/leads/${leadId}`,
-      {
-        responsible_user_id: Number(selectedAttendant._id),
-      },
+      `https://${SUBDOMAIN}.kommo.com/api/v4/leads`,
+      [
+        {
+          id: Number(leadId),
+          responsible_user_id: Number(selectedAttendant._id),
+        },
+      ],
       {
         headers: {
           Authorization: `Bearer ${ACCESS_TOKEN}`,
@@ -133,6 +136,12 @@ app.post("/api/v1/distribution", async (req, res) => {
       .status(200)
       .json({ message: "Lead atualizado com sucesso no kommo" });
   } catch (error) {
+    if (error.response) {
+      console.error(
+        "Erro da API do Kommo:",
+        JSON.stringify(error.response.data, null, 2),
+      );
+    }
     console.error("Erro na distribuição: " + error);
     return res.status(500).json({ message: error.message });
   }
