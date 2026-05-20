@@ -86,7 +86,7 @@ app.get("/api/v1/status", async (req, res) => {
 });
 
 app.post("/api/v1/distribution", async (req, res) => {
-  const leadData = req.body.talk?.update?.[0];
+  const leadData = req.body.leads?.status?.[0];
   console.log(req.body);
   console.log(leadData);
 
