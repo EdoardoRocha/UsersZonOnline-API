@@ -99,8 +99,8 @@ app.post("/api/v1/distribution", async (req, res) => {
   const leadId = leadData.id;
 
   // Puxar lista dos usuários online
-  const onlineUsers = await OnlineUser.find({ status: "online" }, null, {
-    sort: { createdAt: -1 },
+  const onlineUsers = await OnlineUser.find({ status: "online" }).sort({
+    createdAt: -1,
   });
   // Verificar se todos estão offline
   if (!onlineUsers)
