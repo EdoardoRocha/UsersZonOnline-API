@@ -4,6 +4,7 @@ import express from "express";
 import mongoose, { Schema } from "mongoose";
 import { EventEmitter } from "events";
 import axios from "axios";
+import { connectDB } from "./db.js";
 
 const app = express();
 EventEmitter.defaultMaxListeners = 20;
@@ -17,13 +18,6 @@ const indexPointers = {
   "pos-venda": 0,
   ef: 0,
 };
-
-// Conexão
-async function main() {
-  await mongoose.connect(process.env.MONGO_URL);
-  console.log("Conectou ao mongoose");
-}
-main().catch((err) => console.log(err));
 
 // Schema
 const OnlineUser = mongoose.model(
@@ -58,6 +52,19 @@ const OnlineUser = mongoose.model(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors());
+
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
+    console.error("[DB] Falha ao conectar:", err.message);
+    return res.status(503).json({
+      message: "Banco de dados indisponível",
+      error: err.message,
+    });
+  }
+});
 
 async function handleDistribution(req, res, groupSlug) {
   const leadData = req.body.leads?.status?.[0];
@@ -122,6 +129,13 @@ async function handleDistribution(req, res, groupSlug) {
 }
 
 //Routes
+app.get("/api/v1/health", async (req, res) => {
+  return res.status(200).json({
+    ok: true,
+    db: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+  });
+});
+
 app.post("/api/v1/presence", async (req, res) => {
   const { _id, name, status, group } = req.body;
 
@@ -210,6 +224,11 @@ app.post("/api/v1/distribution", (req, res) =>
   handleDistribution(req, res, "digital"),
 );
 
-app.listen(process.env.PORT, () => {
-  console.log(`Servidor rodando na porta ${process.env.PORT}`);
-});
+export default app;
+
+if (process.env.NODE_ENV !== "production") {
+  const port = process.env.PORT ?? 3000;
+  app.listen(port, () => {
+    console.log(`Servidor rodando na porta ${port}`);
+  });
+}
