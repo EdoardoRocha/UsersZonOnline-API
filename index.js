@@ -3,14 +3,20 @@ import cors from "cors";
 import express from "express";
 import mongoose, { Schema } from "mongoose";
 import { EventEmitter } from "events";
-import { type } from "os";
 import axios from "axios";
 
 const app = express();
 EventEmitter.defaultMaxListeners = 20;
 
-// Global Variables
-let indexCurrentPointer = 0;
+const VALID_GROUPS = ["digital", "vipzon", "sac", "pos-venda", "ef"];
+
+const indexPointers = {
+  digital: 0,
+  vipzon: 0,
+  sac: 0,
+  "pos-venda": 0,
+  ef: 0,
+};
 
 // Conexão
 async function main() {
@@ -37,6 +43,12 @@ const OnlineUser = mongoose.model(
         default: "offline",
         index: true,
       },
+      groups: {
+        type: [String],
+        enum: VALID_GROUPS,
+        default: [],
+        index: true,
+      },
     },
     { timestamps: true },
   ),
@@ -47,46 +59,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 
-//Routes
-app.post("/api/v1/presence", async (req, res) => {
-  const { _id, name, status } = req.body;
-
-  try {
-    const usuarioAtualizado = await OnlineUser.findOneAndUpdate(
-      { _id },
-      { name, status },
-      {
-        upsert: true,
-        returnDocument: "after",
-        runValidators: true,
-      },
-    );
-
-    return res.status(200).json({
-      message: "Status do usuário atualizado com sucesso!",
-      data: usuarioAtualizado,
-    });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: error.message });
-  }
-});
-
-app.get("/api/v1/status", async (req, res) => {
-  try {
-    const users = await OnlineUser.find({}, "_id name status");
-    return res.status(200).json(users);
-  } catch (error) {
-    console.error("[ERRO NA ROTA GET]:", error);
-
-    return res.status(500).json({
-      message: "Erro interno no servidor ao buscar status",
-      error: error.message,
-    });
-  }
-});
-
-app.post("/api/v1/distribution", async (req, res) => {
+async function handleDistribution(req, res, groupSlug) {
   const leadData = req.body.leads?.status?.[0];
 
   if (!leadData) {
@@ -98,22 +71,21 @@ app.post("/api/v1/distribution", async (req, res) => {
 
   const leadId = leadData.id;
 
-  // Puxar lista dos usuários online
-  const onlineUsers = await OnlineUser.find({ status: "online" });
-  // Verificar se todos estão offline
-  if (!onlineUsers)
-    return res
-      .status(400)
-      .json({ message: "Nenhum usuário online nesse momento." });
-  // Construir lógico de fila
-  let indexDestination = indexCurrentPointer % onlineUsers.length;
+  const onlineUsers = await OnlineUser.find({ groups: groupSlug });
+
+  if (!onlineUsers.length) {
+    return res.status(400).json({
+      message: `Nenhum usuário online no grupo ${groupSlug} nesse momento.`,
+    });
+  }
+
+  const indexDestination = indexPointers[groupSlug] % onlineUsers.length;
   const selectedAttendant = onlineUsers[indexDestination];
-  indexCurrentPointer = (indexDestination + 1) % onlineUsers.length;
+  indexPointers[groupSlug] = (indexDestination + 1) % onlineUsers.length;
 
   const SUBDOMAIN = process.env.SUBDOMAIN;
   const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 
-  //Enviar resposta para o Kommo
   try {
     await axios.patch(
       `https://${SUBDOMAIN}.kommo.com/api/v4/leads`,
@@ -139,12 +111,104 @@ app.post("/api/v1/distribution", async (req, res) => {
         "Erro da API do Kommo:",
         JSON.stringify(error.response.data, null, 2),
       );
-      return;
+      return res.status(error.response.status || 500).json({
+        message: "Erro ao atualizar lead no Kommo",
+        error: error.response.data,
+      });
     }
     console.error("Erro na distribuição: " + error);
     return res.status(500).json({ message: error.message });
   }
+}
+
+//Routes
+app.post("/api/v1/presence", async (req, res) => {
+  const { _id, name, status, group } = req.body;
+
+  if (!group || !VALID_GROUPS.includes(group)) {
+    return res.status(400).json({
+      message: `Campo 'group' obrigatório. Valores válidos: ${VALID_GROUPS.join(", ")}`,
+    });
+  }
+
+  if (!["online", "offline"].includes(status)) {
+    return res.status(400).json({
+      message: "Campo 'status' inválido. Use 'online' ou 'offline'.",
+    });
+  }
+
+  try {
+    const update =
+      status === "online"
+        ? {
+            $addToSet: { groups: group },
+            $set: { name, status: "online" },
+          }
+        : {
+            $pull: { groups: group },
+            $set: { name },
+          };
+
+    let usuarioAtualizado = await OnlineUser.findOneAndUpdate({ _id }, update, {
+      upsert: status === "online",
+      returnDocument: "after",
+      runValidators: true,
+    });
+
+    if (status === "offline" && usuarioAtualizado) {
+      const isStillOnline = usuarioAtualizado.groups.length > 0;
+      if (!isStillOnline) {
+        usuarioAtualizado = await OnlineUser.findOneAndUpdate(
+          { _id },
+          { status: "offline" },
+          { returnDocument: "after", runValidators: true },
+        );
+      }
+    }
+
+    return res.status(200).json({
+      message: "Status do usuário atualizado com sucesso!",
+      data: usuarioAtualizado,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: error.message });
+  }
 });
+
+app.get("/api/v1/status", async (req, res) => {
+  try {
+    const users = await OnlineUser.find({}, "_id name status groups");
+    return res.status(200).json(users);
+  } catch (error) {
+    console.error("[ERRO NA ROTA GET]:", error);
+
+    return res.status(500).json({
+      message: "Erro interno no servidor ao buscar status",
+      error: error.message,
+    });
+  }
+});
+
+app.post("/api/v1/distribution/digital", (req, res) =>
+  handleDistribution(req, res, "digital"),
+);
+app.post("/api/v1/distribution/vipzon", (req, res) =>
+  handleDistribution(req, res, "vipzon"),
+);
+app.post("/api/v1/distribution/sac", (req, res) =>
+  handleDistribution(req, res, "sac"),
+);
+app.post("/api/v1/distribution/pos-venda", (req, res) =>
+  handleDistribution(req, res, "pos-venda"),
+);
+app.post("/api/v1/distribution/ef", (req, res) =>
+  handleDistribution(req, res, "ef"),
+);
+
+app.post("/api/v1/distribution", (req, res) =>
+  handleDistribution(req, res, "digital"),
+);
 
 app.listen(process.env.PORT, () => {
   console.log(`Servidor rodando na porta ${process.env.PORT}`);
