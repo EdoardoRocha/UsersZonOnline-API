@@ -4,12 +4,14 @@ import express from "express";
 import mongoose, { Schema } from "mongoose";
 import { EventEmitter } from "events";
 import axios from "axios";
+import { waitUntil } from "@vercel/functions";
 import { connectDB } from "./db.js";
 
 const app = express();
 EventEmitter.defaultMaxListeners = 20;
 
 const VALID_GROUPS = ["digital", "vipzon", "sac", "pos-venda", "ef", "rota"];
+const ROTA_GROUP = "rota";
 
 const indexPointers = {
   digital: 0,
@@ -17,8 +19,29 @@ const indexPointers = {
   sac: 0,
   "pos-venda": 0,
   ef: 0,
-  rota: 0,
 };
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractLeadFromBody(body) {
+  return body.leads?.add?.[0] || body.leads?.status?.[0];
+}
+
+function isInvalidKommoUser(error) {
+  return error.response?.data?.["validation-errors"]?.[0]?.errors?.some(
+    (e) => e.path === "responsible_user_id" && e.code === "NotSupportedChoice",
+  );
+}
+
+function scheduleBackgroundWork(promise) {
+  try {
+    waitUntil(promise);
+  } catch {
+    promise.catch((err) => console.error("[background]", err));
+  }
+}
 
 // Schema
 const OnlineUser = mongoose.model(
@@ -49,6 +72,245 @@ const OnlineUser = mongoose.model(
   ),
 );
 
+const distributionJobSchema = new Schema(
+  {
+    leadId: { type: Number, required: true, index: true },
+    group: { type: String, required: true, index: true },
+    status: {
+      type: String,
+      enum: ["pending", "processing", "done", "failed"],
+      default: "pending",
+      index: true,
+    },
+    assignedTo: { type: String },
+    error: { type: String },
+  },
+  { timestamps: true },
+);
+
+distributionJobSchema.index({ group: 1, status: 1, createdAt: 1 });
+distributionJobSchema.index(
+  { leadId: 1, group: 1 },
+  { unique: true, partialFilterExpression: { status: "pending" } },
+);
+
+const DistributionJob = mongoose.model("DistributionJob", distributionJobSchema);
+
+const DistributionState = mongoose.model(
+  "DistributionState",
+  new Schema({
+    _id: { type: String, required: true },
+    pointer: { type: Number, default: 0 },
+  }),
+);
+
+const DistributionLock = mongoose.model(
+  "DistributionLock",
+  new Schema({
+    _id: { type: String, required: true },
+    lockedUntil: { type: Date, default: () => new Date(0) },
+  }),
+);
+
+async function getOnlineValidUsers(groupSlug) {
+  const onlineUsers = await OnlineUser.find({
+    groups: groupSlug,
+    status: "online",
+  }).sort({ createdAt: -1 });
+
+  return onlineUsers.filter(
+    (u) => u._id && Number.isInteger(Number(u._id)) && Number(u._id) > 0,
+  );
+}
+
+async function getNextAttendant(groupSlug, validUsers) {
+  const state = await DistributionState.findOneAndUpdate(
+    { _id: groupSlug },
+    { $inc: { pointer: 1 } },
+    { upsert: true, returnDocument: "after" },
+  );
+  const index = (state.pointer - 1) % validUsers.length;
+  return validUsers[index];
+}
+
+async function patchLeadInKommo(leadId, responsibleUserId) {
+  const SUBDOMAIN = process.env.SUBDOMAIN;
+  const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
+  const maxRetries = 3;
+
+  for (let retry = 0; retry < maxRetries; retry++) {
+    try {
+      await axios.patch(
+        `https://${SUBDOMAIN}.kommo.com/api/v4/leads`,
+        [
+          {
+            id: Number(leadId),
+            responsible_user_id: Number(responsibleUserId),
+          },
+        ],
+        {
+          headers: {
+            Authorization: `Bearer ${ACCESS_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+      return { success: true };
+    } catch (error) {
+      if (error.response?.status === 429 && retry < maxRetries - 1) {
+        await sleep(1000 * (retry + 1));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer) {
+  for (let attempt = 0; attempt < validUsers.length; attempt++) {
+    let selectedAttendant;
+
+    if (useAtomicPointer) {
+      selectedAttendant = await getNextAttendant(groupSlug, validUsers);
+    } else {
+      if (indexPointers[groupSlug] == null) {
+        indexPointers[groupSlug] = 0;
+      }
+      const indexDestination = indexPointers[groupSlug] % validUsers.length;
+      selectedAttendant = validUsers[indexDestination];
+      indexPointers[groupSlug] = (indexDestination + 1) % validUsers.length;
+    }
+
+    if (!selectedAttendant?._id) {
+      return { success: false, error: "Atendente inválido na fila" };
+    }
+
+    try {
+      await patchLeadInKommo(leadId, selectedAttendant._id);
+      return { success: true, assignedTo: selectedAttendant._id };
+    } catch (error) {
+      if (isInvalidKommoUser(error) && attempt < validUsers.length - 1) {
+        console.warn(
+          `[distribution/${groupSlug}] Kommo rejeitou user ${selectedAttendant._id}, tentando próximo.`,
+        );
+        continue;
+      }
+
+      const kommoError = error.response?.data;
+      console.error(
+        `[distribution/${groupSlug}] Erro da API do Kommo (user ${selectedAttendant._id}):`,
+        JSON.stringify(kommoError ?? error.message, null, 2),
+      );
+      return {
+        success: false,
+        error: kommoError ? JSON.stringify(kommoError) : error.message,
+        assignedTo: selectedAttendant._id,
+        statusCode: error.response?.status,
+      };
+    }
+  }
+
+  return { success: false, error: "Nenhum atendente válido no Kommo" };
+}
+
+async function acquireRotaLock() {
+  const lockTtl = Number(process.env.ROTA_QUEUE_LOCK_TTL_MS ?? 300000);
+  const now = new Date();
+  const lockedUntil = new Date(now.getTime() + lockTtl);
+
+  await DistributionLock.findOneAndUpdate(
+    { _id: "rota-processor" },
+    { $setOnInsert: { lockedUntil: new Date(0) } },
+    { upsert: true },
+  );
+
+  const acquired = await DistributionLock.findOneAndUpdate(
+    { _id: "rota-processor", lockedUntil: { $lte: now } },
+    { $set: { lockedUntil } },
+    { returnDocument: "after" },
+  );
+
+  return !!acquired;
+}
+
+async function releaseRotaLock() {
+  await DistributionLock.findByIdAndUpdate("rota-processor", {
+    $set: { lockedUntil: new Date(0) },
+  });
+}
+
+async function processRotaQueue() {
+  const acquired = await acquireRotaLock();
+  if (!acquired) return;
+
+  const delayMs = Number(process.env.ROTA_DISTRIBUTION_DELAY_MS ?? 200);
+
+  try {
+    while (true) {
+      const job = await DistributionJob.findOneAndUpdate(
+        { group: ROTA_GROUP, status: "pending" },
+        { $set: { status: "processing" } },
+        { sort: { createdAt: 1 }, returnDocument: "after" },
+      );
+
+      if (!job) break;
+
+      try {
+        const validUsers = await getOnlineValidUsers(ROTA_GROUP);
+
+        if (!validUsers.length) {
+          await DistributionJob.findByIdAndUpdate(job._id, {
+            $set: {
+              status: "failed",
+              error: "Nenhum usuário online no grupo rota",
+            },
+          });
+          continue;
+        }
+
+        const result = await assignLeadInKommo(
+          job.leadId,
+          ROTA_GROUP,
+          validUsers,
+          true,
+        );
+
+        await DistributionJob.findByIdAndUpdate(job._id, {
+          $set: {
+            status: result.success ? "done" : "failed",
+            assignedTo: result.assignedTo,
+            error: result.error,
+          },
+        });
+      } catch (err) {
+        await DistributionJob.findByIdAndUpdate(job._id, {
+          $set: { status: "failed", error: err.message },
+        });
+      }
+
+      await sleep(delayMs);
+    }
+  } finally {
+    await releaseRotaLock();
+  }
+}
+
+async function enqueueRotaLead(leadId) {
+  try {
+    await DistributionJob.create({
+      leadId: Number(leadId),
+      group: ROTA_GROUP,
+      status: "pending",
+    });
+    return { enqueued: true, duplicate: false };
+  } catch (err) {
+    if (err.code === 11000) {
+      return { enqueued: true, duplicate: true };
+    }
+    throw err;
+  }
+}
+
 // Middlewares
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -68,7 +330,7 @@ app.use(async (req, res, next) => {
 });
 
 async function handleDistribution(req, res, groupSlug) {
-  const leadData = req.body.leads?.add?.[0] || req.body.leads?.status?.[0];;
+  const leadData = extractLeadFromBody(req.body);
 
   if (!leadData) {
     console.log("Webhook recebido, mas não está atrelado a um lead.");
@@ -78,93 +340,51 @@ async function handleDistribution(req, res, groupSlug) {
   }
 
   const leadId = leadData.id;
+  const validUsers = await getOnlineValidUsers(groupSlug);
 
-  const onlineUsers = await OnlineUser.find({
-    groups: groupSlug,
-    status: "online",
-  }).sort({ createdAt: -1 });
-
-  if (!onlineUsers.length) {
+  if (!validUsers.length) {
     return res.status(400).json({
       message: `Nenhum usuário online no grupo ${groupSlug} nesse momento.`,
     });
   }
 
-  const validUsers = onlineUsers.filter(
-    (u) => u._id && Number.isInteger(Number(u._id)) && Number(u._id) > 0,
-  );
+  const result = await assignLeadInKommo(leadId, groupSlug, validUsers, false);
 
-  if (!validUsers.length) {
-    return res.status(400).json({
-      message: `Nenhum usuário com ID Kommo válido no grupo ${groupSlug}.`,
+  if (result.success) {
+    return res
+      .status(200)
+      .json({ message: "Lead atualizado com sucesso no kommo" });
+  }
+
+  return res.status(result.statusCode || 500).json({
+    message: "Erro ao atualizar lead no Kommo",
+    error: result.error,
+  });
+}
+
+async function handleRotaDistribution(req, res) {
+  const leadData = extractLeadFromBody(req.body);
+
+  if (!leadData) {
+    console.log("Webhook recebido, mas não está atrelado a um lead.");
+    return res
+      .status(200)
+      .json({ message: "Ignorado: Não é uma atualização de lead." });
+  }
+
+  try {
+    const { duplicate } = await enqueueRotaLead(leadData.id);
+
+    scheduleBackgroundWork(processRotaQueue());
+
+    return res.status(200).json({
+      message: duplicate
+        ? "Lead já enfileirado para distribuição"
+        : "Lead enfileirado para distribuição",
     });
-  }
-
-  if (indexPointers[groupSlug] == null) {
-    indexPointers[groupSlug] = 0;
-  }
-
-  const SUBDOMAIN = process.env.SUBDOMAIN;
-  const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
-
-  for (let attempt = 0; attempt < validUsers.length; attempt++) {
-    const indexDestination = indexPointers[groupSlug] % validUsers.length;
-    const selectedAttendant = validUsers[indexDestination];
-    indexPointers[groupSlug] = (indexDestination + 1) % validUsers.length;
-
-    if (!selectedAttendant?._id) {
-      return res.status(500).json({
-        message: `Falha na distribuição: ponteiro inválido para o grupo '${groupSlug}'.`,
-      });
-    }
-
-    try {
-      await axios.patch(
-        `https://${SUBDOMAIN}.kommo.com/api/v4/leads`,
-        [
-          {
-            id: Number(leadId),
-            responsible_user_id: Number(selectedAttendant._id),
-          },
-        ],
-        {
-          headers: {
-            Authorization: `Bearer ${ACCESS_TOKEN}`,
-            "Content-Type": "application/json",
-          },
-        },
-      );
-      return res
-        .status(200)
-        .json({ message: "Lead atualizado com sucesso no kommo" });
-    } catch (error) {
-      if (error.response) {
-        const isInvalidUser = error.response.data?.[
-          "validation-errors"
-        ]?.[0]?.errors?.some(
-          (e) =>
-            e.path === "responsible_user_id" && e.code === "NotSupportedChoice",
-        );
-
-        if (isInvalidUser && attempt < validUsers.length - 1) {
-          console.warn(
-            `[distribution/${groupSlug}] Kommo rejeitou user ${selectedAttendant._id}, tentando próximo.`,
-          );
-          continue;
-        }
-
-        console.error(
-          `[distribution/${groupSlug}] Erro da API do Kommo (user ${selectedAttendant._id}):`,
-          JSON.stringify(error.response.data, null, 2),
-        );
-        return res.status(error.response.status || 500).json({
-          message: "Erro ao atualizar lead no Kommo",
-          error: error.response.data,
-        });
-      }
-      console.error("Erro na distribuição: " + error);
-      return res.status(500).json({ message: error.message });
-    }
+  } catch (error) {
+    console.error("[distribution/rota] Erro ao enfileirar:", error);
+    return res.status(500).json({ message: error.message });
   }
 }
 
@@ -262,8 +482,27 @@ app.post("/api/v1/distribution/ef", (req, res) =>
   handleDistribution(req, res, "ef"),
 );
 app.post("/api/v1/distribution/rota", (req, res) =>
-  handleDistribution(req, res, "rota"),
+  handleRotaDistribution(req, res),
 );
+
+app.get("/api/v1/distribution/rota/queue", async (req, res) => {
+  try {
+    const statuses = ["pending", "processing", "done", "failed"];
+    const counts = Object.fromEntries(
+      await Promise.all(
+        statuses.map(async (status) => [
+          status,
+          await DistributionJob.countDocuments({ group: ROTA_GROUP, status }),
+        ]),
+      ),
+    );
+
+    return res.status(200).json(counts);
+  } catch (error) {
+    console.error("[distribution/rota/queue]", error);
+    return res.status(500).json({ message: error.message });
+  }
+});
 
 export default app;
 
