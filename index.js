@@ -17,6 +17,7 @@ const indexPointers = {
   sac: 0,
   "pos-venda": 0,
   ef: 0,
+  rota: 0,
 };
 
 // Schema
@@ -86,9 +87,19 @@ async function handleDistribution(req, res, groupSlug) {
     });
   }
 
+  if (indexPointers[groupSlug] == null) {
+    indexPointers[groupSlug] = 0;
+  }
+
   const indexDestination = indexPointers[groupSlug] % onlineUsers.length;
   const selectedAttendant = onlineUsers[indexDestination];
   indexPointers[groupSlug] = (indexDestination + 1) % onlineUsers.length;
+
+  if (!selectedAttendant?._id) {
+    return res.status(500).json({
+      message: `Falha na distribuição: ponteiro inválido para o grupo '${groupSlug}'.`,
+    });
+  }
 
   const SUBDOMAIN = process.env.SUBDOMAIN;
   const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
