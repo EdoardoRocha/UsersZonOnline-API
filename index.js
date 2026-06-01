@@ -82,7 +82,7 @@ async function handleDistribution(req, res, groupSlug) {
   const onlineUsers = await OnlineUser.find({
     groups: groupSlug,
     status: "online",
-  }).sort({ createdAt: 1 });
+  }).sort({ createdAt: -1 });
 
   if (!onlineUsers.length) {
     return res.status(400).json({
@@ -233,7 +233,7 @@ app.post("/api/v1/presence", async (req, res) => {
 app.get("/api/v1/status", async (req, res) => {
   try {
     const users = await OnlineUser.find({}, "_id name status groups").sort({
-      createdAt: 1,
+      createdAt: -1,
     });
     return res.status(200).json(users);
   } catch (error) {
