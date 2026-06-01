@@ -67,6 +67,9 @@ app.use(async (req, res, next) => {
 });
 
 async function handleDistribution(req, res, groupSlug) {
+  console.log('--- Novo Webhook do Kommo ---');
+  console.log('Headers:', req.headers['content-type']);
+  console.log('Body:', JSON.stringify(req.body, null, 2));
   const leadData = req.body.leads?.status?.[0];
 
   if (!leadData) {
@@ -155,13 +158,13 @@ app.post("/api/v1/presence", async (req, res) => {
     const update =
       status === "online"
         ? {
-            $addToSet: { groups: group },
-            $set: { name, status: "online" },
-          }
+          $addToSet: { groups: group },
+          $set: { name, status: "online" },
+        }
         : {
-            $pull: { groups: group },
-            $set: { name },
-          };
+          $pull: { groups: group },
+          $set: { name },
+        };
 
     let usuarioAtualizado = await OnlineUser.findOneAndUpdate({ _id }, update, {
       upsert: status === "online",
@@ -218,10 +221,6 @@ app.post("/api/v1/distribution/pos-venda", (req, res) =>
 );
 app.post("/api/v1/distribution/ef", (req, res) =>
   handleDistribution(req, res, "ef"),
-);
-
-app.post("/api/v1/distribution", (req, res) =>
-  handleDistribution(req, res, "digital"),
 );
 
 export default app;
