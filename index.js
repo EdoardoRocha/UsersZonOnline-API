@@ -9,7 +9,7 @@ import { connectDB } from "./db.js";
 const app = express();
 EventEmitter.defaultMaxListeners = 20;
 
-const VALID_GROUPS = ["digital", "vipzon", "sac", "pos-venda", "ef"];
+const VALID_GROUPS = ["digital", "vipzon", "sac", "pos-venda", "ef", "rota"];
 
 const indexPointers = {
   digital: 0,
