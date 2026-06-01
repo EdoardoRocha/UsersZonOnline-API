@@ -79,7 +79,10 @@ async function handleDistribution(req, res, groupSlug) {
 
   const leadId = leadData.id;
 
-  const onlineUsers = await OnlineUser.find({ groups: groupSlug });
+  const onlineUsers = await OnlineUser.find({
+    groups: groupSlug,
+    status: "online",
+  }).sort({ createdAt: 1 });
 
   if (!onlineUsers.length) {
     return res.status(400).json({
@@ -87,55 +90,81 @@ async function handleDistribution(req, res, groupSlug) {
     });
   }
 
-  if (indexPointers[groupSlug] == null) {
-    indexPointers[groupSlug] = 0;
+  const validUsers = onlineUsers.filter(
+    (u) => u._id && Number.isInteger(Number(u._id)) && Number(u._id) > 0,
+  );
+
+  if (!validUsers.length) {
+    return res.status(400).json({
+      message: `Nenhum usuário com ID Kommo válido no grupo ${groupSlug}.`,
+    });
   }
 
-  const indexDestination = indexPointers[groupSlug] % onlineUsers.length;
-  const selectedAttendant = onlineUsers[indexDestination];
-  indexPointers[groupSlug] = (indexDestination + 1) % onlineUsers.length;
-
-  if (!selectedAttendant?._id) {
-    return res.status(500).json({
-      message: `Falha na distribuição: ponteiro inválido para o grupo '${groupSlug}'.`,
-    });
+  if (indexPointers[groupSlug] == null) {
+    indexPointers[groupSlug] = 0;
   }
 
   const SUBDOMAIN = process.env.SUBDOMAIN;
   const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 
-  try {
-    await axios.patch(
-      `https://${SUBDOMAIN}.kommo.com/api/v4/leads`,
-      [
-        {
-          id: Number(leadId),
-          responsible_user_id: Number(selectedAttendant._id),
-        },
-      ],
-      {
-        headers: {
-          Authorization: `Bearer ${ACCESS_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-      },
-    );
-    return res
-      .status(200)
-      .json({ message: "Lead atualizado com sucesso no kommo" });
-  } catch (error) {
-    if (error.response) {
-      console.error(
-        "Erro da API do Kommo:",
-        JSON.stringify(error.response.data, null, 2),
-      );
-      return res.status(error.response.status || 500).json({
-        message: "Erro ao atualizar lead no Kommo",
-        error: error.response.data,
+  for (let attempt = 0; attempt < validUsers.length; attempt++) {
+    const indexDestination = indexPointers[groupSlug] % validUsers.length;
+    const selectedAttendant = validUsers[indexDestination];
+    indexPointers[groupSlug] = (indexDestination + 1) % validUsers.length;
+
+    if (!selectedAttendant?._id) {
+      return res.status(500).json({
+        message: `Falha na distribuição: ponteiro inválido para o grupo '${groupSlug}'.`,
       });
     }
-    console.error("Erro na distribuição: " + error);
-    return res.status(500).json({ message: error.message });
+
+    try {
+      await axios.patch(
+        `https://${SUBDOMAIN}.kommo.com/api/v4/leads`,
+        [
+          {
+            id: Number(leadId),
+            responsible_user_id: Number(selectedAttendant._id),
+          },
+        ],
+        {
+          headers: {
+            Authorization: `Bearer ${ACCESS_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+      return res
+        .status(200)
+        .json({ message: "Lead atualizado com sucesso no kommo" });
+    } catch (error) {
+      if (error.response) {
+        const isInvalidUser = error.response.data?.[
+          "validation-errors"
+        ]?.[0]?.errors?.some(
+          (e) =>
+            e.path === "responsible_user_id" && e.code === "NotSupportedChoice",
+        );
+
+        if (isInvalidUser && attempt < validUsers.length - 1) {
+          console.warn(
+            `[distribution/${groupSlug}] Kommo rejeitou user ${selectedAttendant._id}, tentando próximo.`,
+          );
+          continue;
+        }
+
+        console.error(
+          `[distribution/${groupSlug}] Erro da API do Kommo (user ${selectedAttendant._id}):`,
+          JSON.stringify(error.response.data, null, 2),
+        );
+        return res.status(error.response.status || 500).json({
+          message: "Erro ao atualizar lead no Kommo",
+          error: error.response.data,
+        });
+      }
+      console.error("Erro na distribuição: " + error);
+      return res.status(500).json({ message: error.message });
+    }
   }
 }
 
@@ -203,7 +232,9 @@ app.post("/api/v1/presence", async (req, res) => {
 
 app.get("/api/v1/status", async (req, res) => {
   try {
-    const users = await OnlineUser.find({}, "_id name status groups");
+    const users = await OnlineUser.find({}, "_id name status groups").sort({
+      createdAt: 1,
+    });
     return res.status(200).json(users);
   } catch (error) {
     console.error("[ERRO NA ROTA GET]:", error);
