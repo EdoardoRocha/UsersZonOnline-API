@@ -219,6 +219,9 @@ app.post("/api/v1/distribution/pos-venda", (req, res) =>
 app.post("/api/v1/distribution/ef", (req, res) =>
   handleDistribution(req, res, "ef"),
 );
+app.post("/api/v1/distribution/rota", (req, res) =>
+  handleDistribution(req, res, "rota"),
+);
 
 export default app;
 
