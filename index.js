@@ -67,10 +67,7 @@ app.use(async (req, res, next) => {
 });
 
 async function handleDistribution(req, res, groupSlug) {
-  console.log('--- Novo Webhook do Kommo ---');
-  console.log('Headers:', req.headers['content-type']);
-  console.log('Body:', JSON.stringify(req.body, null, 2));
-  const leadData = req.body.leads?.status?.[0];
+  const leadData = req.body.leads?.add?.[0] || req.body.leads?.status?.[0];;
 
   if (!leadData) {
     console.log("Webhook recebido, mas não está atrelado a um lead.");
