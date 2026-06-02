@@ -390,10 +390,38 @@ async function handleRotaDistribution(req, res) {
 
 //Routes
 app.get("/api/v1/health", async (req, res) => {
-  return res.status(200).json({
-    ok: true,
-    db: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
-  });
+  const start = Date.now();
+
+  try {
+    await mongoose.connection.db.admin().ping();
+    const latencyMs = Date.now() - start;
+
+    return res.status(200).json({
+      ok: true,
+      status: "healthy",
+      checks: {
+        api: "up",
+        database: "connected",
+      },
+      latencyMs,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("[health] Falha no ping do banco:", error.message);
+
+    return res.status(503).json({
+      ok: false,
+      status: "degraded",
+      checks: {
+        api: "up",
+        database: "disconnected",
+      },
+      message: "Banco de dados indisponível",
+      error: error.message,
+      latencyMs: Date.now() - start,
+      timestamp: new Date().toISOString(),
+    });
+  }
 });
 
 app.post("/api/v1/presence", async (req, res) => {
