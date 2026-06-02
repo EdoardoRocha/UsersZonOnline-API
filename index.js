@@ -183,6 +183,18 @@ async function getOnlineValidUsers(groupSlug) {
   );
 }
 
+async function removeUserFromGroup(userId, groupSlug) {
+  const updated = await OnlineUser.findOneAndUpdate(
+    { _id: String(userId) },
+    { $pull: { groups: groupSlug } },
+    { returnDocument: "after" },
+  );
+
+  if (updated && updated.groups.length === 0) {
+    await OnlineUser.findByIdAndUpdate(String(userId), { status: "offline" });
+  }
+}
+
 async function getNextAttendant(groupSlug, validUsers) {
   const state = await DistributionState.findOneAndUpdate(
     { _id: groupSlug },
@@ -227,18 +239,21 @@ async function patchLeadInKommo(leadId, responsibleUserId) {
 }
 
 async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer) {
-  for (let attempt = 0; attempt < validUsers.length; attempt++) {
+  let remainingUsers = [...validUsers];
+  const skippedIds = [];
+
+  while (remainingUsers.length > 0) {
     let selectedAttendant;
 
     if (useAtomicPointer) {
-      selectedAttendant = await getNextAttendant(groupSlug, validUsers);
+      selectedAttendant = await getNextAttendant(groupSlug, remainingUsers);
     } else {
       if (indexPointers[groupSlug] == null) {
         indexPointers[groupSlug] = 0;
       }
-      const indexDestination = indexPointers[groupSlug] % validUsers.length;
-      selectedAttendant = validUsers[indexDestination];
-      indexPointers[groupSlug] = (indexDestination + 1) % validUsers.length;
+      const indexDestination = indexPointers[groupSlug] % remainingUsers.length;
+      selectedAttendant = remainingUsers[indexDestination];
+      indexPointers[groupSlug] = (indexDestination + 1) % remainingUsers.length;
     }
 
     if (!selectedAttendant?._id) {
@@ -249,17 +264,15 @@ async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer
       await patchLeadInKommo(leadId, selectedAttendant._id);
       return { success: true, assignedTo: selectedAttendant._id };
     } catch (error) {
-      if (isInvalidKommoUser(error) && attempt < validUsers.length - 1) {
+      if (isInvalidKommoUser(error)) {
         console.warn(
-          `[distribution/${groupSlug}] Kommo rejeitou user ${selectedAttendant._id}, tentando próximo.`,
+          `[distribution/${groupSlug}] Kommo rejeitou user ${selectedAttendant._id}, removendo da fila.`,
         );
-        await writeDistributionLog({
-          type: "kommo_user_skipped",
-          group: groupSlug,
-          leadId,
-          message: `Usuário ${selectedAttendant._id} rejeitado pelo Kommo, tentando próximo`,
-          details: error.response?.data,
-        });
+        await removeUserFromGroup(selectedAttendant._id, groupSlug);
+        skippedIds.push(selectedAttendant._id);
+        remainingUsers = remainingUsers.filter(
+          (u) => u._id !== selectedAttendant._id,
+        );
         continue;
       }
 
@@ -288,13 +301,18 @@ async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer
     }
   }
 
+  const message = skippedIds.length
+    ? `Nenhum atendente válido no Kommo. Removidos da fila: ${skippedIds.join(", ")}`
+    : "Nenhum atendente válido no Kommo";
+
   await writeDistributionLog({
     type: "kommo_error",
     group: groupSlug,
     leadId,
-    message: "Nenhum atendente válido no Kommo",
+    message,
+    details: skippedIds.length ? { skippedIds } : undefined,
   });
-  return { success: false, error: "Nenhum atendente válido no Kommo" };
+  return { success: false, error: message };
 }
 
 async function acquireRotaLock() {
@@ -444,8 +462,8 @@ async function handleDistribution(req, res, groupSlug) {
       leadId,
       message: `Nenhum usuário online no grupo ${groupSlug}`,
     });
-    return res.status(400).json({
-      message: `Nenhum usuário online no grupo ${groupSlug} nesse momento.`,
+    return res.status(200).json({
+      message: `Ignorado: nenhum usuário online no grupo ${groupSlug}`,
     });
   }
 
