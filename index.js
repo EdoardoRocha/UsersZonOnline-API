@@ -306,7 +306,7 @@ async function acquireRotaLock() {
     { _id: "rota-processor" },
     { $setOnInsert: { lockedUntil: new Date(0) } },
     { upsert: true },
-  );
+  ); 
 
   const acquired = await DistributionLock.findOneAndUpdate(
     { _id: "rota-processor", lockedUntil: { $lte: now } },
