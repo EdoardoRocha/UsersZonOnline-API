@@ -112,6 +112,66 @@ const DistributionLock = mongoose.model(
   }),
 );
 
+const DistributionLog = mongoose.model(
+  "DistributionLog",
+  new Schema(
+    {
+      type: {
+        type: String,
+        enum: [
+          "kommo_error",
+          "server_error",
+          "queue_failed",
+          "no_users_online",
+          "enqueue_error",
+          "kommo_user_skipped",
+        ],
+        required: true,
+        index: true,
+      },
+      group: { type: String, index: true },
+      leadId: { type: Number, index: true },
+      message: { type: String, required: true },
+      details: { type: Schema.Types.Mixed },
+    },
+    { timestamps: true },
+  ),
+);
+
+DistributionLog.schema.index({ group: 1, createdAt: -1 });
+
+async function writeDistributionLog({
+  type,
+  group,
+  leadId,
+  message,
+  details,
+}) {
+  try {
+    await DistributionLog.create({
+      type,
+      group,
+      leadId: leadId != null ? Number(leadId) : undefined,
+      message,
+      details,
+    });
+  } catch (err) {
+    console.error("[log] Falha ao gravar DistributionLog:", err.message);
+  }
+}
+
+function summarizeKommoError(error) {
+  if (typeof error === "string") {
+    try {
+      const parsed = JSON.parse(error);
+      return parsed.detail || parsed.title || error;
+    } catch {
+      return error;
+    }
+  }
+  return error?.detail || error?.title || "Erro desconhecido no Kommo";
+}
+
 async function getOnlineValidUsers(groupSlug) {
   const onlineUsers = await OnlineUser.find({
     groups: groupSlug,
@@ -193,6 +253,13 @@ async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer
         console.warn(
           `[distribution/${groupSlug}] Kommo rejeitou user ${selectedAttendant._id}, tentando próximo.`,
         );
+        await writeDistributionLog({
+          type: "kommo_user_skipped",
+          group: groupSlug,
+          leadId,
+          message: `Usuário ${selectedAttendant._id} rejeitado pelo Kommo, tentando próximo`,
+          details: error.response?.data,
+        });
         continue;
       }
 
@@ -201,6 +268,17 @@ async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer
         `[distribution/${groupSlug}] Erro da API do Kommo (user ${selectedAttendant._id}):`,
         JSON.stringify(kommoError ?? error.message, null, 2),
       );
+      await writeDistributionLog({
+        type: "kommo_error",
+        group: groupSlug,
+        leadId,
+        message: summarizeKommoError(kommoError ?? error.message),
+        details: {
+          userId: selectedAttendant._id,
+          statusCode: error.response?.status,
+          kommo: kommoError,
+        },
+      });
       return {
         success: false,
         error: kommoError ? JSON.stringify(kommoError) : error.message,
@@ -210,6 +288,12 @@ async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer
     }
   }
 
+  await writeDistributionLog({
+    type: "kommo_error",
+    group: groupSlug,
+    leadId,
+    message: "Nenhum atendente válido no Kommo",
+  });
   return { success: false, error: "Nenhum atendente válido no Kommo" };
 }
 
@@ -259,11 +343,15 @@ async function processRotaQueue() {
         const validUsers = await getOnlineValidUsers(ROTA_GROUP);
 
         if (!validUsers.length) {
+          const errorMsg = "Nenhum usuário online no grupo rota";
           await DistributionJob.findByIdAndUpdate(job._id, {
-            $set: {
-              status: "failed",
-              error: "Nenhum usuário online no grupo rota",
-            },
+            $set: { status: "failed", error: errorMsg },
+          });
+          await writeDistributionLog({
+            type: "no_users_online",
+            group: ROTA_GROUP,
+            leadId: job.leadId,
+            message: errorMsg,
           });
           continue;
         }
@@ -285,6 +373,13 @@ async function processRotaQueue() {
       } catch (err) {
         await DistributionJob.findByIdAndUpdate(job._id, {
           $set: { status: "failed", error: err.message },
+        });
+        await writeDistributionLog({
+          type: "queue_failed",
+          group: ROTA_GROUP,
+          leadId: job.leadId,
+          message: err.message,
+          details: { stack: err.stack },
         });
       }
 
@@ -343,6 +438,12 @@ async function handleDistribution(req, res, groupSlug) {
   const validUsers = await getOnlineValidUsers(groupSlug);
 
   if (!validUsers.length) {
+    await writeDistributionLog({
+      type: "no_users_online",
+      group: groupSlug,
+      leadId,
+      message: `Nenhum usuário online no grupo ${groupSlug}`,
+    });
     return res.status(400).json({
       message: `Nenhum usuário online no grupo ${groupSlug} nesse momento.`,
     });
@@ -384,6 +485,12 @@ async function handleRotaDistribution(req, res) {
     });
   } catch (error) {
     console.error("[distribution/rota] Erro ao enfileirar:", error);
+    await writeDistributionLog({
+      type: "enqueue_error",
+      group: ROTA_GROUP,
+      leadId: leadData.id,
+      message: error.message,
+    });
     return res.status(500).json({ message: error.message });
   }
 }
@@ -474,6 +581,12 @@ app.post("/api/v1/presence", async (req, res) => {
     });
   } catch (error) {
     console.error(error);
+    await writeDistributionLog({
+      type: "server_error",
+      group,
+      message: `Erro ao atualizar presença: ${error.message}`,
+      details: { userId: _id },
+    });
     return res.status(500).json({ message: error.message });
   }
 });
@@ -525,9 +638,39 @@ app.get("/api/v1/distribution/rota/queue", async (req, res) => {
       ),
     );
 
-    return res.status(200).json(counts);
+    const response = { ...counts };
+
+    if (req.query.include === "failed") {
+      response.failedJobs = await DistributionJob.find({
+        group: ROTA_GROUP,
+        status: "failed",
+      })
+        .sort({ createdAt: -1 })
+        .limit(20)
+        .select("leadId error assignedTo createdAt");
+    }
+
+    return res.status(200).json(response);
   } catch (error) {
     console.error("[distribution/rota/queue]", error);
+    return res.status(500).json({ message: error.message });
+  }
+});
+
+app.get("/api/v1/logs", async (req, res) => {
+  try {
+    const group = req.query.group;
+    const limit = Math.min(Number(req.query.limit) || 50, 100);
+    const filter = group ? { group } : {};
+
+    const logs = await DistributionLog.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .select("type group leadId message details createdAt");
+
+    return res.status(200).json(logs);
+  } catch (error) {
+    console.error("[logs]", error);
     return res.status(500).json({ message: error.message });
   }
 });
