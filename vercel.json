@@ -4,13 +4,8 @@
     {
       "src": "index.js",
       "use": "@vercel/node",
-      "config": { "maxDuration": 300 }
+      "config": { "maxDuration": 60 }
     }
   ],
-  "routes": [{ "src": "/(.*)", "dest": "index.js" }],
-  "functions": {
-    "index.js": {
-      "maxDuration": 300
-    }
-  }
+  "routes": [{ "src": "/(.*)", "dest": "index.js" }]
 }
