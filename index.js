@@ -134,6 +134,32 @@ function extractLeadFromBody(body) {
   return body.leads?.add?.[0] || body.leads?.status?.[0];
 }
 
+function debugDistributionLog(location, message, data, hypothesisId) {
+  console.log(`[debug-distribution] ${message}`, {
+    location,
+    hypothesisId,
+    ...data,
+  });
+  // #region agent log
+  fetch("http://127.0.0.1:7880/ingest/86e94e1a-50d8-4401-b3cf-06525982f660", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Debug-Session-Id": "568baa",
+    },
+    body: JSON.stringify({
+      sessionId: "568baa",
+      location,
+      message,
+      data,
+      hypothesisId,
+      timestamp: Date.now(),
+      runId: "pre-fix",
+    }),
+  }).catch(() => {});
+  // #endregion
+}
+
 function isInvalidKommoUser(error) {
   return error.response?.data?.["validation-errors"]?.[0]?.errors?.some(
     (e) => e.path === "responsible_user_id" && e.code === "NotSupportedChoice",
@@ -783,6 +809,20 @@ async function handleDistribution(req, res, groupSlug) {
 
 async function handleQueueDistribution(req, res, groupSlug) {
   const leadData = extractLeadFromBody(req.body);
+  debugDistributionLog(
+    "index.js:handleQueueDistribution",
+    "queue webhook received",
+    {
+      groupSlug,
+      path: req.path,
+      method: req.method,
+      contentType: req.headers["content-type"],
+      bodyKeys: req.body ? Object.keys(req.body) : [],
+      leadId: leadData?.id ?? null,
+      hasLead: !!leadData,
+    },
+    "C",
+  );
 
   if (!leadData) {
     console.log("Webhook recebido, mas não está atrelado a um lead.");
@@ -1142,6 +1182,18 @@ app.post("/api/v1/distribution/:groupSlug", async (req, res) => {
 
   try {
     const group = await getActiveGroup(groupSlug);
+    debugDistributionLog(
+      "index.js:distribution/:groupSlug",
+      "generic distribution route hit",
+      {
+        groupSlug,
+        path: req.path,
+        groupFound: !!group,
+        distributionType: group?.distributionType ?? null,
+        leadId: extractLeadFromBody(req.body)?.id ?? null,
+      },
+      group ? "C" : "A",
+    );
     if (!group) {
       return res.status(404).json({ message: "Grupo não encontrado." });
     }
