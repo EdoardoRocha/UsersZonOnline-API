@@ -356,29 +356,25 @@ async function getNextAttendant(groupSlug, validUsers) {
   return validUsers[index];
 }
 
-async function patchLeadInKommo(leadId, responsibleUserId) {
+function getKommoHeaders() {
+  return {
+    Authorization: `Bearer ${process.env.ACCESS_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+}
+
+async function patchKommoEntities(resource, items) {
   const SUBDOMAIN = process.env.SUBDOMAIN;
-  const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
   const maxRetries = 3;
 
   for (let retry = 0; retry < maxRetries; retry++) {
     try {
       await axios.patch(
-        `https://${SUBDOMAIN}.kommo.com/api/v4/leads`,
-        [
-          {
-            id: Number(leadId),
-            responsible_user_id: Number(responsibleUserId),
-          },
-        ],
-        {
-          headers: {
-            Authorization: `Bearer ${ACCESS_TOKEN}`,
-            "Content-Type": "application/json",
-          },
-        },
+        `https://${SUBDOMAIN}.kommo.com/api/v4/${resource}`,
+        items,
+        { headers: getKommoHeaders() },
       );
-      return { success: true };
+      return;
     } catch (error) {
       if (error.response?.status === 429 && retry < maxRetries - 1) {
         await sleep(1000 * (retry + 1));
@@ -389,9 +385,82 @@ async function patchLeadInKommo(leadId, responsibleUserId) {
   }
 }
 
+async function patchLeadInKommo(leadId, responsibleUserId) {
+  await patchKommoEntities("leads", [
+    {
+      id: Number(leadId),
+      responsible_user_id: Number(responsibleUserId),
+    },
+  ]);
+}
+
+async function patchContactsInKommo(contactIds, responsibleUserId) {
+  if (!contactIds.length) return;
+
+  await patchKommoEntities(
+    "contacts",
+    contactIds.map((id) => ({
+      id: Number(id),
+      responsible_user_id: Number(responsibleUserId),
+    })),
+  );
+}
+
+async function fetchLeadContactIds(leadId) {
+  const SUBDOMAIN = process.env.SUBDOMAIN;
+  const maxRetries = 3;
+
+  for (let retry = 0; retry < maxRetries; retry++) {
+    try {
+      const response = await axios.get(
+        `https://${SUBDOMAIN}.kommo.com/api/v4/leads/${Number(leadId)}?with=contacts`,
+        { headers: getKommoHeaders() },
+      );
+      return (
+        response.data?._embedded?.contacts
+          ?.map((c) => c.id)
+          .filter(Boolean) ?? []
+      );
+    } catch (error) {
+      if (error.response?.status === 429 && retry < maxRetries - 1) {
+        await sleep(1000 * (retry + 1));
+        continue;
+      }
+      console.warn(
+        `[kommo] Falha ao buscar contatos do lead ${leadId}:`,
+        error.response?.data ?? error.message,
+      );
+      return [];
+    }
+  }
+
+  return [];
+}
+
+async function handleKommoUserRejected(
+  selectedAttendant,
+  groupSlug,
+  skippedIds,
+  remainingUsers,
+) {
+  console.warn(
+    `[distribution/${groupSlug}] Kommo rejeitou user ${selectedAttendant._id}, removendo da fila.`,
+  );
+  await removeUserFromGroup(selectedAttendant._id, groupSlug);
+  skippedIds.push(selectedAttendant._id);
+  return remainingUsers.filter((u) => u._id !== selectedAttendant._id);
+}
+
 async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer) {
   let remainingUsers = [...validUsers];
   const skippedIds = [];
+  const contactIds = await fetchLeadContactIds(leadId);
+
+  if (!contactIds.length) {
+    console.warn(
+      `[distribution/${groupSlug}] Lead ${leadId} sem contatos vinculados; atribuindo apenas o lead.`,
+    );
+  }
 
   while (remainingUsers.length > 0) {
     let selectedAttendant;
@@ -413,16 +482,58 @@ async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer
 
     try {
       await patchLeadInKommo(leadId, selectedAttendant._id);
+
+      if (contactIds.length) {
+        try {
+          await patchContactsInKommo(contactIds, selectedAttendant._id);
+        } catch (contactError) {
+          if (isInvalidKommoUser(contactError)) {
+            remainingUsers = await handleKommoUserRejected(
+              selectedAttendant,
+              groupSlug,
+              skippedIds,
+              remainingUsers,
+            );
+            continue;
+          }
+
+          const kommoError = contactError.response?.data;
+          console.error(
+            `[distribution/${groupSlug}] Erro ao atualizar contatos (user ${selectedAttendant._id}):`,
+            JSON.stringify(kommoError ?? contactError.message, null, 2),
+          );
+          await writeDistributionLog({
+            type: "kommo_error",
+            group: groupSlug,
+            leadId,
+            message: summarizeKommoError(kommoError ?? contactError.message),
+            details: {
+              userId: selectedAttendant._id,
+              contactIds,
+              leadPatched: true,
+              statusCode: contactError.response?.status,
+              kommo: kommoError,
+            },
+          });
+          return {
+            success: false,
+            error: kommoError
+              ? JSON.stringify(kommoError)
+              : contactError.message,
+            assignedTo: selectedAttendant._id,
+            statusCode: contactError.response?.status,
+          };
+        }
+      }
+
       return { success: true, assignedTo: selectedAttendant._id };
     } catch (error) {
       if (isInvalidKommoUser(error)) {
-        console.warn(
-          `[distribution/${groupSlug}] Kommo rejeitou user ${selectedAttendant._id}, removendo da fila.`,
-        );
-        await removeUserFromGroup(selectedAttendant._id, groupSlug);
-        skippedIds.push(selectedAttendant._id);
-        remainingUsers = remainingUsers.filter(
-          (u) => u._id !== selectedAttendant._id,
+        remainingUsers = await handleKommoUserRejected(
+          selectedAttendant,
+          groupSlug,
+          skippedIds,
+          remainingUsers,
         );
         continue;
       }
@@ -623,13 +734,13 @@ async function handleDistribution(req, res, groupSlug) {
   const result = await assignLeadInKommo(leadId, groupSlug, validUsers, false);
 
   if (result.success) {
-    return res
-      .status(200)
-      .json({ message: "Lead atualizado com sucesso no kommo" });
+    return res.status(200).json({
+      message: "Lead e contato(s) atualizados com sucesso no Kommo",
+    });
   }
 
   return res.status(result.statusCode || 500).json({
-    message: "Erro ao atualizar lead no Kommo",
+    message: "Erro ao atualizar lead e contato(s) no Kommo",
     error: result.error,
   });
 }
