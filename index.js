@@ -93,6 +93,18 @@ const DEFAULT_PLUGIN_GROUPS = [
       { userId: "15118328", name: "Geovana Rodrigues" },
     ],
   },
+  {
+    slug: "purificador",
+    label: "Purificador",
+    distributionType: "queue",
+    sortOrder: 6,
+    members: [
+      { userId: "12619271", name: "Andréa Lins" },
+      { userId: "12619287", name: "Angélica Ferreira" },
+      { userId: "12619299", name: "Adriana Guerra" },
+      { userId: "12619295", name: "Tânia Guerra" },
+    ],
+  },
 ];
 
 function slugifyLabel(label) {
@@ -236,8 +248,32 @@ async function seedDefaultGroups() {
   console.log("[seed] Grupos padrão inseridos.");
 }
 
+async function ensureMissingDefaultGroups() {
+  for (const def of DEFAULT_PLUGIN_GROUPS) {
+    await PluginGroup.updateOne(
+      { slug: def.slug },
+      {
+        $setOnInsert: {
+          slug: def.slug,
+          label: def.label,
+          distributionType: def.distributionType,
+          sortOrder: def.sortOrder,
+          members: def.members,
+          active: true,
+        },
+      },
+      { upsert: true },
+    );
+  }
+}
+
 async function ensureSeeded() {
-  if (!seedPromise) seedPromise = seedDefaultGroups();
+  if (!seedPromise) {
+    seedPromise = (async () => {
+      await seedDefaultGroups();
+      await ensureMissingDefaultGroups();
+    })();
+  }
   await seedPromise;
 }
 
@@ -1097,6 +1133,9 @@ app.post("/api/v1/distribution/ef", (req, res) =>
 app.post("/api/v1/distribution/rota", (req, res) =>
   handleRotaDistribution(req, res),
 );
+app.post("/api/v1/distribution/purificador", (req, res) =>
+  handleQueueDistribution(req, res, "purificador"),
+);
 
 app.post("/api/v1/distribution/:groupSlug", async (req, res) => {
   const { groupSlug } = req.params;
@@ -1118,14 +1157,22 @@ app.post("/api/v1/distribution/:groupSlug", async (req, res) => {
   }
 });
 
-app.get("/api/v1/distribution/rota/queue", async (req, res) => {
+async function handleQueueStatus(req, res, groupSlug) {
   try {
+    const group = await getActiveGroup(groupSlug);
+    if (!group) {
+      return res.status(404).json({ message: "Grupo não encontrado." });
+    }
+    if (group.distributionType !== "queue") {
+      return res.status(404).json({ message: "Grupo não utiliza fila." });
+    }
+
     const statuses = ["pending", "processing", "done", "failed"];
     const counts = Object.fromEntries(
       await Promise.all(
         statuses.map(async (status) => [
           status,
-          await DistributionJob.countDocuments({ group: ROTA_GROUP, status }),
+          await DistributionJob.countDocuments({ group: groupSlug, status }),
         ]),
       ),
     );
@@ -1134,7 +1181,7 @@ app.get("/api/v1/distribution/rota/queue", async (req, res) => {
 
     if (req.query.include === "failed") {
       response.failedJobs = await DistributionJob.find({
-        group: ROTA_GROUP,
+        group: groupSlug,
         status: "failed",
       })
         .sort({ createdAt: -1 })
@@ -1144,10 +1191,18 @@ app.get("/api/v1/distribution/rota/queue", async (req, res) => {
 
     return res.status(200).json(response);
   } catch (error) {
-    console.error("[distribution/rota/queue]", error);
+    console.error(`[distribution/${groupSlug}/queue]`, error);
     return res.status(500).json({ message: error.message });
   }
-});
+}
+
+app.get("/api/v1/distribution/rota/queue", (req, res) =>
+  handleQueueStatus(req, res, ROTA_GROUP),
+);
+
+app.get("/api/v1/distribution/:groupSlug/queue", (req, res) =>
+  handleQueueStatus(req, res, req.params.groupSlug),
+);
 
 app.get("/api/v1/logs", async (req, res) => {
   try {
