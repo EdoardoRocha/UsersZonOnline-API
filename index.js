@@ -12,6 +12,30 @@ EventEmitter.defaultMaxListeners = 20;
 
 const ROTA_GROUP = "rota";
 
+const COMPOSITE_ROUTES = {
+  "digital-purificador": {
+    slug: "digital-purificador",
+    label: "Digital + Purificador",
+    sourceSlugs: ["digital", "purificador"],
+    distributionType: "queue",
+    sortOrder: 100,
+  },
+  "digital-ef": {
+    slug: "digital-ef",
+    label: "Digital + Elemento filtrante",
+    sourceSlugs: ["digital", "ef"],
+    distributionType: "queue",
+    sortOrder: 101,
+  },
+  "purificador-ef": {
+    slug: "purificador-ef",
+    label: "Purificador + Elemento filtrante",
+    sourceSlugs: ["purificador", "ef"],
+    distributionType: "queue",
+    sortOrder: 102,
+  },
+};
+
 const indexPointers = {};
 
 const DEFAULT_PLUGIN_GROUPS = [
@@ -134,30 +158,12 @@ function extractLeadFromBody(body) {
   return body.leads?.add?.[0] || body.leads?.status?.[0];
 }
 
-function debugDistributionLog(location, message, data, hypothesisId) {
-  console.log(`[debug-distribution] ${message}`, {
-    location,
-    hypothesisId,
-    ...data,
-  });
-  // #region agent log
-  fetch("http://127.0.0.1:7880/ingest/86e94e1a-50d8-4401-b3cf-06525982f660", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "568baa",
-    },
-    body: JSON.stringify({
-      sessionId: "568baa",
-      location,
-      message,
-      data,
-      hypothesisId,
-      timestamp: Date.now(),
-      runId: "pre-fix",
-    }),
-  }).catch(() => {});
-  // #endregion
+function getCompositeRoute(slug) {
+  return COMPOSITE_ROUTES[slug] ?? null;
+}
+
+function resolveRouteLabel(slug) {
+  return getCompositeRoute(slug)?.label ?? slug;
 }
 
 function isInvalidKommoUser(error) {
@@ -318,10 +324,22 @@ function formatGroupResponse(group) {
     label: group.label,
     distributionType: group.distributionType,
     sortOrder: group.sortOrder,
-    members: group.members.map((m) => ({
+    members: (group.members ?? []).map((m) => ({
       userId: m.userId,
       name: m.name,
     })),
+  };
+}
+
+function formatCompositeGroupResponse(composite) {
+  return {
+    slug: composite.slug,
+    label: composite.label,
+    distributionType: composite.distributionType,
+    sortOrder: composite.sortOrder,
+    members: [],
+    composite: true,
+    sourceSlugs: composite.sourceSlugs,
   };
 }
 
@@ -394,6 +412,38 @@ async function getOnlineValidUsers(groupSlug) {
   return onlineUsers.filter(
     (u) => u._id && Number.isInteger(Number(u._id)) && Number(u._id) > 0,
   );
+}
+
+async function getCombinedOnlineUsers(sourceSlugs) {
+  const combined = [];
+  const seen = new Set();
+
+  for (const slug of sourceSlugs) {
+    const users = await getOnlineValidUsers(slug);
+    for (const user of users) {
+      if (seen.has(user._id)) continue;
+      seen.add(user._id);
+      combined.push({ ...user.toObject(), _sourceGroup: slug });
+    }
+  }
+
+  return combined;
+}
+
+async function getValidUsersForRoute(routeSlug) {
+  const composite = getCompositeRoute(routeSlug);
+  if (composite) {
+    return getCombinedOnlineUsers(composite.sourceSlugs);
+  }
+  return getOnlineValidUsers(routeSlug);
+}
+
+function getNoUsersOnlineMessage(routeSlug) {
+  const composite = getCompositeRoute(routeSlug);
+  if (composite) {
+    return `Nenhum usuário online nos grupos ${composite.sourceSlugs.join(", ")}`;
+  }
+  return `Nenhum usuário online no grupo ${routeSlug}`;
 }
 
 async function removeUserFromGroup(userId, groupSlug) {
@@ -508,7 +558,8 @@ async function handleKommoUserRejected(
   console.warn(
     `[distribution/${groupSlug}] Kommo rejeitou user ${selectedAttendant._id}, removendo da fila.`,
   );
-  await removeUserFromGroup(selectedAttendant._id, groupSlug);
+  const removalGroup = selectedAttendant._sourceGroup ?? groupSlug;
+  await removeUserFromGroup(selectedAttendant._id, removalGroup);
   skippedIds.push(selectedAttendant._id);
   return remainingUsers.filter((u) => u._id !== selectedAttendant._id);
 }
@@ -683,10 +734,10 @@ async function processGroupQueue(groupSlug) {
       if (!job) break;
 
       try {
-        const validUsers = await getOnlineValidUsers(groupSlug);
+        const validUsers = await getValidUsersForRoute(groupSlug);
 
         if (!validUsers.length) {
-          const errorMsg = `Nenhum usuário online no grupo ${groupSlug}`;
+          const errorMsg = getNoUsersOnlineMessage(groupSlug);
           await DistributionJob.findByIdAndUpdate(job._id, {
             $set: { status: "failed", error: errorMsg },
           });
@@ -809,20 +860,6 @@ async function handleDistribution(req, res, groupSlug) {
 
 async function handleQueueDistribution(req, res, groupSlug) {
   const leadData = extractLeadFromBody(req.body);
-  debugDistributionLog(
-    "index.js:handleQueueDistribution",
-    "queue webhook received",
-    {
-      groupSlug,
-      path: req.path,
-      method: req.method,
-      contentType: req.headers["content-type"],
-      bodyKeys: req.body ? Object.keys(req.body) : [],
-      leadId: leadData?.id ?? null,
-      hasLead: !!leadData,
-    },
-    "C",
-  );
 
   if (!leadData) {
     console.log("Webhook recebido, mas não está atrelado a um lead.");
@@ -975,7 +1012,14 @@ app.get("/api/v1/groups", async (req, res) => {
       .sort({ sortOrder: 1, label: 1 })
       .select("slug label distributionType sortOrder members");
 
-    return res.status(200).json(groups.map(formatGroupResponse));
+    const compositeGroups = Object.values(COMPOSITE_ROUTES)
+      .sort((a, b) => a.sortOrder - b.sortOrder)
+      .map(formatCompositeGroupResponse);
+
+    return res.status(200).json([
+      ...groups.map(formatGroupResponse),
+      ...compositeGroups,
+    ]);
   } catch (error) {
     console.error("[groups GET]", error);
     return res.status(500).json({ message: error.message });
@@ -1176,24 +1220,26 @@ app.post("/api/v1/distribution/rota", (req, res) =>
 app.post("/api/v1/distribution/purificador", (req, res) =>
   handleQueueDistribution(req, res, "purificador"),
 );
+app.post("/api/v1/distribution/digital-purificador", (req, res) =>
+  handleQueueDistribution(req, res, "digital-purificador"),
+);
+app.post("/api/v1/distribution/digital-ef", (req, res) =>
+  handleQueueDistribution(req, res, "digital-ef"),
+);
+app.post("/api/v1/distribution/purificador-ef", (req, res) =>
+  handleQueueDistribution(req, res, "purificador-ef"),
+);
 
 app.post("/api/v1/distribution/:groupSlug", async (req, res) => {
   const { groupSlug } = req.params;
 
   try {
+    const composite = getCompositeRoute(groupSlug);
+    if (composite?.distributionType === "queue") {
+      return handleQueueDistribution(req, res, groupSlug);
+    }
+
     const group = await getActiveGroup(groupSlug);
-    debugDistributionLog(
-      "index.js:distribution/:groupSlug",
-      "generic distribution route hit",
-      {
-        groupSlug,
-        path: req.path,
-        groupFound: !!group,
-        distributionType: group?.distributionType ?? null,
-        leadId: extractLeadFromBody(req.body)?.id ?? null,
-      },
-      group ? "C" : "A",
-    );
     if (!group) {
       return res.status(404).json({ message: "Grupo não encontrado." });
     }
@@ -1211,7 +1257,8 @@ app.post("/api/v1/distribution/:groupSlug", async (req, res) => {
 
 async function handleQueueStatus(req, res, groupSlug) {
   try {
-    const group = await getActiveGroup(groupSlug);
+    const composite = getCompositeRoute(groupSlug);
+    const group = composite ?? (await getActiveGroup(groupSlug));
     if (!group) {
       return res.status(404).json({ message: "Grupo não encontrado." });
     }
