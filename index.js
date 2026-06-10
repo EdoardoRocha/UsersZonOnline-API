@@ -10,8 +10,6 @@ import { connectDB } from "./db.js";
 const app = express();
 EventEmitter.defaultMaxListeners = 20;
 
-const ROTA_GROUP = "rota";
-
 const COMPOSITE_ROUTES = {
   "digital-purificador": {
     slug: "digital-purificador",
@@ -367,66 +365,6 @@ function formatCompositeGroupResponse(composite) {
   };
 }
 
-const DistributionLog = mongoose.model(
-  "DistributionLog",
-  new Schema(
-    {
-      type: {
-        type: String,
-        enum: [
-          "kommo_error",
-          "server_error",
-          "queue_failed",
-          "no_users_online",
-          "enqueue_error",
-          "kommo_user_skipped",
-        ],
-        required: true,
-        index: true,
-      },
-      group: { type: String, index: true },
-      leadId: { type: Number, index: true },
-      message: { type: String, required: true },
-      details: { type: Schema.Types.Mixed },
-    },
-    { timestamps: true },
-  ),
-);
-
-DistributionLog.schema.index({ group: 1, createdAt: -1 });
-
-async function writeDistributionLog({
-  type,
-  group,
-  leadId,
-  message,
-  details,
-}) {
-  try {
-    await DistributionLog.create({
-      type,
-      group,
-      leadId: leadId != null ? Number(leadId) : undefined,
-      message,
-      details,
-    });
-  } catch (err) {
-    console.error("[log] Falha ao gravar DistributionLog:", err.message);
-  }
-}
-
-function summarizeKommoError(error) {
-  if (typeof error === "string") {
-    try {
-      const parsed = JSON.parse(error);
-      return parsed.detail || parsed.title || error;
-    } catch {
-      return error;
-    }
-  }
-  return error?.detail || error?.title || "Erro desconhecido no Kommo";
-}
-
 async function getOnlineValidUsers(groupSlug) {
   const onlineUsers = await OnlineUser.find({
     groups: groupSlug,
@@ -639,19 +577,6 @@ async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer
             `[distribution/${groupSlug}] Erro ao atualizar contatos (user ${selectedAttendant._id}):`,
             JSON.stringify(kommoError ?? contactError.message, null, 2),
           );
-          await writeDistributionLog({
-            type: "kommo_error",
-            group: groupSlug,
-            leadId,
-            message: summarizeKommoError(kommoError ?? contactError.message),
-            details: {
-              userId: selectedAttendant._id,
-              contactIds,
-              leadPatched: true,
-              statusCode: contactError.response?.status,
-              kommo: kommoError,
-            },
-          });
           return {
             success: false,
             error: kommoError
@@ -680,17 +605,6 @@ async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer
         `[distribution/${groupSlug}] Erro da API do Kommo (user ${selectedAttendant._id}):`,
         JSON.stringify(kommoError ?? error.message, null, 2),
       );
-      await writeDistributionLog({
-        type: "kommo_error",
-        group: groupSlug,
-        leadId,
-        message: summarizeKommoError(kommoError ?? error.message),
-        details: {
-          userId: selectedAttendant._id,
-          statusCode: error.response?.status,
-          kommo: kommoError,
-        },
-      });
       return {
         success: false,
         error: kommoError ? JSON.stringify(kommoError) : error.message,
@@ -704,13 +618,6 @@ async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer
     ? `Nenhum atendente válido no Kommo. Removidos da fila: ${skippedIds.join(", ")}`
     : "Nenhum atendente válido no Kommo";
 
-  await writeDistributionLog({
-    type: "kommo_error",
-    group: groupSlug,
-    leadId,
-    message,
-    details: skippedIds.length ? { skippedIds } : undefined,
-  });
   return { success: false, error: message };
 }
 
@@ -765,12 +672,6 @@ async function processGroupQueue(groupSlug) {
           await DistributionJob.findByIdAndUpdate(job._id, {
             $set: { status: "failed", error: errorMsg },
           });
-          await writeDistributionLog({
-            type: "no_users_online",
-            group: groupSlug,
-            leadId: job.leadId,
-            message: errorMsg,
-          });
           continue;
         }
 
@@ -791,13 +692,6 @@ async function processGroupQueue(groupSlug) {
       } catch (err) {
         await DistributionJob.findByIdAndUpdate(job._id, {
           $set: { status: "failed", error: err.message },
-        });
-        await writeDistributionLog({
-          type: "queue_failed",
-          group: groupSlug,
-          leadId: job.leadId,
-          message: err.message,
-          details: { stack: err.stack },
         });
       }
 
@@ -857,12 +751,6 @@ async function handleDistribution(req, res, groupSlug) {
   const validUsers = await getOnlineValidUsers(groupSlug);
 
   if (!validUsers.length) {
-    await writeDistributionLog({
-      type: "no_users_online",
-      group: groupSlug,
-      leadId,
-      message: `Nenhum usuário online no grupo ${groupSlug}`,
-    });
     return res.status(200).json({
       message: `Ignorado: nenhum usuário online no grupo ${groupSlug}`,
     });
@@ -904,12 +792,6 @@ async function handleQueueDistribution(req, res, groupSlug) {
     });
   } catch (error) {
     console.error(`[distribution/${groupSlug}] Erro ao enfileirar:`, error);
-    await writeDistributionLog({
-      type: "enqueue_error",
-      group: groupSlug,
-      leadId: leadData.id,
-      message: error.message,
-    });
     return res.status(500).json({ message: error.message });
   }
 }
@@ -1000,12 +882,6 @@ app.post("/api/v1/presence", async (req, res) => {
     });
   } catch (error) {
     console.error(error);
-    await writeDistributionLog({
-      type: "server_error",
-      group,
-      message: `Erro ao atualizar presença: ${error.message}`,
-      details: { userId: _id },
-    });
     return res.status(500).json({ message: error.message });
   }
 });
@@ -1271,72 +1147,6 @@ app.post("/api/v1/distribution/:groupSlug", async (req, res) => {
     return handleDistribution(req, res, groupSlug);
   } catch (error) {
     console.error(`[distribution/${groupSlug}]`, error);
-    return res.status(500).json({ message: error.message });
-  }
-});
-
-async function handleQueueStatus(req, res, groupSlug) {
-  try {
-    const composite = getCompositeRoute(groupSlug);
-    const group = composite ?? (await getActiveGroup(groupSlug));
-    if (!group) {
-      return res.status(404).json({ message: "Grupo não encontrado." });
-    }
-    if (group.distributionType !== "queue") {
-      return res.status(404).json({ message: "Grupo não utiliza fila." });
-    }
-
-    const statuses = ["pending", "processing", "done", "failed"];
-    const counts = Object.fromEntries(
-      await Promise.all(
-        statuses.map(async (status) => [
-          status,
-          await DistributionJob.countDocuments({ group: groupSlug, status }),
-        ]),
-      ),
-    );
-
-    const response = { ...counts };
-
-    if (req.query.include === "failed") {
-      response.failedJobs = await DistributionJob.find({
-        group: groupSlug,
-        status: "failed",
-      })
-        .sort({ createdAt: -1 })
-        .limit(20)
-        .select("leadId error assignedTo createdAt");
-    }
-
-    return res.status(200).json(response);
-  } catch (error) {
-    console.error(`[distribution/${groupSlug}/queue]`, error);
-    return res.status(500).json({ message: error.message });
-  }
-}
-
-app.get("/api/v1/distribution/rota/queue", (req, res) =>
-  handleQueueStatus(req, res, ROTA_GROUP),
-);
-
-app.get("/api/v1/distribution/:groupSlug/queue", (req, res) =>
-  handleQueueStatus(req, res, req.params.groupSlug),
-);
-
-app.get("/api/v1/logs", async (req, res) => {
-  try {
-    const group = req.query.group;
-    const limit = Math.min(Number(req.query.limit) || 50, 100);
-    const filter = group ? { group } : {};
-
-    const logs = await DistributionLog.find(filter)
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .select("type group leadId message details createdAt");
-
-    return res.status(200).json(logs);
-  } catch (error) {
-    console.error("[logs]", error);
     return res.status(500).json({ message: error.message });
   }
 });
