@@ -40,7 +40,7 @@ const DEFAULT_PLUGIN_GROUPS = [
   {
     slug: "digital",
     label: "Digital",
-    distributionType: "instant",
+    distributionType: "queue",
     sortOrder: 0,
     members: [
       { userId: "12610415", name: "Andressa Santos" },
@@ -53,7 +53,7 @@ const DEFAULT_PLUGIN_GROUPS = [
   {
     slug: "sac",
     label: "SAC",
-    distributionType: "instant",
+    distributionType: "queue",
     sortOrder: 1,
     members: [
       { userId: "13763631", name: "Mara Rayane" },
@@ -65,7 +65,7 @@ const DEFAULT_PLUGIN_GROUPS = [
   {
     slug: "vipzon",
     label: "VipZon",
-    distributionType: "instant",
+    distributionType: "queue",
     sortOrder: 2,
     members: [
       { userId: "14070208", name: "Beatriz Araújo" },
@@ -76,7 +76,7 @@ const DEFAULT_PLUGIN_GROUPS = [
   {
     slug: "ef",
     label: "Elemento filtrante",
-    distributionType: "instant",
+    distributionType: "queue",
     sortOrder: 3,
     members: [
       { userId: "14134368", name: "Leila Ricardo" },
@@ -97,7 +97,7 @@ const DEFAULT_PLUGIN_GROUPS = [
   {
     slug: "pos-venda",
     label: "Pós-venda",
-    distributionType: "instant",
+    distributionType: "queue",
     sortOrder: 4,
     members: [
       { userId: "15118328", name: "Geovana Rodrigues" },
@@ -107,7 +107,7 @@ const DEFAULT_PLUGIN_GROUPS = [
   {
     slug: "rota",
     label: "Rota",
-    distributionType: "instant",
+    distributionType: "queue",
     sortOrder: 5,
     members: [
       { userId: "14107476", name: "Claudia Lacerda" },
@@ -261,7 +261,7 @@ const PluginGroup = mongoose.model(
       distributionType: {
         type: String,
         enum: ["instant", "queue"],
-        default: "instant",
+        default: "queue",
       },
       sortOrder: { type: Number, default: 0 },
       active: { type: Boolean, default: true },
@@ -297,25 +297,15 @@ async function ensureMissingDefaultGroups() {
   }
 }
 
-async function migrateRotaToInstant() {
-  await PluginGroup.updateOne(
-    { slug: "rota" },
-    { $set: { distributionType: "instant" } },
-  );
-
-  const result = await DistributionJob.updateMany(
-    { group: "rota", status: { $in: ["pending", "processing"] } },
-    {
-      $set: {
-        status: "failed",
-        error: "Migração: rota passou para distribuição instantânea",
-      },
-    },
+async function migrateAllGroupsToQueue() {
+  const result = await PluginGroup.updateMany(
+    {},
+    { $set: { distributionType: "queue" } },
   );
 
   if (result.modifiedCount > 0) {
     console.log(
-      `[migration] ${result.modifiedCount} job(s) da fila rota encerrado(s).`,
+      `[migration] ${result.modifiedCount} grupo(s) migrado(s) para fila.`,
     );
   }
 }
@@ -325,7 +315,7 @@ async function ensureSeeded() {
     seedPromise = (async () => {
       await seedDefaultGroups();
       await ensureMissingDefaultGroups();
-      await migrateRotaToInstant();
+      await migrateAllGroupsToQueue();
     })();
   }
   await seedPromise;
@@ -623,7 +613,11 @@ async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer
 
 async function acquireQueueLock(groupSlug) {
   const lockId = `${groupSlug}-processor`;
-  const lockTtl = Number(process.env.ROTA_QUEUE_LOCK_TTL_MS ?? 300000);
+  const lockTtl = Number(
+    process.env.DISTRIBUTION_QUEUE_LOCK_TTL_MS
+      ?? process.env.ROTA_QUEUE_LOCK_TTL_MS
+      ?? 300000,
+  );
   const now = new Date();
   const lockedUntil = new Date(now.getTime() + lockTtl);
 
@@ -650,12 +644,40 @@ async function releaseQueueLock(groupSlug) {
 
 async function processGroupQueue(groupSlug) {
   const acquired = await acquireQueueLock(groupSlug);
-  if (!acquired) return;
+  if (!acquired) {
+    console.warn(
+      `[distribution/${groupSlug}] Fila ocupada, reprocessamento agendado.`,
+    );
+    return;
+  }
 
-  const delayMs = Number(process.env.ROTA_DISTRIBUTION_DELAY_MS ?? 200);
+  const delayMs = Number(
+    process.env.DISTRIBUTION_DELAY_MS
+      ?? process.env.ROTA_DISTRIBUTION_DELAY_MS
+      ?? 1000,
+  );
+  const staleMs = Number(process.env.DISTRIBUTION_STALE_JOB_MS ?? 120000);
+  const maxJobs = Number(process.env.DISTRIBUTION_MAX_JOBS_PER_RUN ?? 20);
 
   try {
-    while (true) {
+    const staleCutoff = new Date(Date.now() - staleMs);
+    const resetResult = await DistributionJob.updateMany(
+      {
+        group: groupSlug,
+        status: "processing",
+        updatedAt: { $lt: staleCutoff },
+      },
+      { $set: { status: "pending" } },
+    );
+    if (resetResult.modifiedCount > 0) {
+      console.warn(
+        `[distribution/${groupSlug}] ${resetResult.modifiedCount} job(s) preso(s) resetado(s) para pending.`,
+      );
+    }
+
+    let processed = 0;
+
+    while (processed < maxJobs) {
       const job = await DistributionJob.findOneAndUpdate(
         { group: groupSlug, status: "pending" },
         { $set: { status: "processing" } },
@@ -672,6 +694,8 @@ async function processGroupQueue(groupSlug) {
           await DistributionJob.findByIdAndUpdate(job._id, {
             $set: { status: "failed", error: errorMsg },
           });
+          processed++;
+          await sleep(delayMs);
           continue;
         }
 
@@ -695,7 +719,18 @@ async function processGroupQueue(groupSlug) {
         });
       }
 
+      processed++;
       await sleep(delayMs);
+    }
+
+    if (processed >= maxJobs) {
+      const pendingCount = await DistributionJob.countDocuments({
+        group: groupSlug,
+        status: "pending",
+      });
+      if (pendingCount > 0) {
+        scheduleBackgroundWork(processGroupQueue(groupSlug));
+      }
     }
   } finally {
     await releaseQueueLock(groupSlug);
@@ -736,39 +771,6 @@ app.use(async (req, res, next) => {
     });
   }
 });
-
-async function handleDistribution(req, res, groupSlug) {
-  const leadData = extractLeadFromBody(req.body);
-
-  if (!leadData) {
-    console.log("Webhook recebido, mas não está atrelado a um lead.");
-    return res
-      .status(200)
-      .json({ message: "Ignorado: Não é uma atualização de lead." });
-  }
-
-  const leadId = leadData.id;
-  const validUsers = await getOnlineValidUsers(groupSlug);
-
-  if (!validUsers.length) {
-    return res.status(200).json({
-      message: `Ignorado: nenhum usuário online no grupo ${groupSlug}`,
-    });
-  }
-
-  const result = await assignLeadInKommo(leadId, groupSlug, validUsers, false);
-
-  if (result.success) {
-    return res.status(200).json({
-      message: "Lead e contato(s) atualizados com sucesso no Kommo",
-    });
-  }
-
-  return res.status(result.statusCode || 500).json({
-    message: "Erro ao atualizar lead e contato(s) no Kommo",
-    error: result.error,
-  });
-}
 
 async function handleQueueDistribution(req, res, groupSlug) {
   const leadData = extractLeadFromBody(req.body);
@@ -1096,22 +1098,22 @@ app.delete("/api/v1/groups/:slug/members/:userId", async (req, res) => {
 });
 
 app.post("/api/v1/distribution/digital", (req, res) =>
-  handleDistribution(req, res, "digital"),
+  handleQueueDistribution(req, res, "digital"),
 );
 app.post("/api/v1/distribution/vipzon", (req, res) =>
-  handleDistribution(req, res, "vipzon"),
+  handleQueueDistribution(req, res, "vipzon"),
 );
 app.post("/api/v1/distribution/sac", (req, res) =>
-  handleDistribution(req, res, "sac"),
+  handleQueueDistribution(req, res, "sac"),
 );
 app.post("/api/v1/distribution/pos-venda", (req, res) =>
-  handleDistribution(req, res, "pos-venda"),
+  handleQueueDistribution(req, res, "pos-venda"),
 );
 app.post("/api/v1/distribution/ef", (req, res) =>
-  handleDistribution(req, res, "ef"),
+  handleQueueDistribution(req, res, "ef"),
 );
 app.post("/api/v1/distribution/rota", (req, res) =>
-  handleDistribution(req, res, "rota"),
+  handleQueueDistribution(req, res, "rota"),
 );
 app.post("/api/v1/distribution/purificador", (req, res) =>
   handleQueueDistribution(req, res, "purificador"),
@@ -1131,7 +1133,7 @@ app.post("/api/v1/distribution/:groupSlug", async (req, res) => {
 
   try {
     const composite = getCompositeRoute(groupSlug);
-    if (composite?.distributionType === "queue") {
+    if (composite) {
       return handleQueueDistribution(req, res, groupSlug);
     }
 
@@ -1140,11 +1142,7 @@ app.post("/api/v1/distribution/:groupSlug", async (req, res) => {
       return res.status(404).json({ message: "Grupo não encontrado." });
     }
 
-    if (group.distributionType === "queue") {
-      return handleQueueDistribution(req, res, groupSlug);
-    }
-
-    return handleDistribution(req, res, groupSlug);
+    return handleQueueDistribution(req, res, groupSlug);
   } catch (error) {
     console.error(`[distribution/${groupSlug}]`, error);
     return res.status(500).json({ message: error.message });
