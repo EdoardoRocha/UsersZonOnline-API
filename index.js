@@ -109,7 +109,7 @@ const DEFAULT_PLUGIN_GROUPS = [
   {
     slug: "rota",
     label: "Rota",
-    distributionType: "queue",
+    distributionType: "instant",
     sortOrder: 5,
     members: [
       { userId: "14107476", name: "Claudia Lacerda" },
@@ -299,11 +299,35 @@ async function ensureMissingDefaultGroups() {
   }
 }
 
+async function migrateRotaToInstant() {
+  await PluginGroup.updateOne(
+    { slug: "rota" },
+    { $set: { distributionType: "instant" } },
+  );
+
+  const result = await DistributionJob.updateMany(
+    { group: "rota", status: { $in: ["pending", "processing"] } },
+    {
+      $set: {
+        status: "failed",
+        error: "Migração: rota passou para distribuição instantânea",
+      },
+    },
+  );
+
+  if (result.modifiedCount > 0) {
+    console.log(
+      `[migration] ${result.modifiedCount} job(s) da fila rota encerrado(s).`,
+    );
+  }
+}
+
 async function ensureSeeded() {
   if (!seedPromise) {
     seedPromise = (async () => {
       await seedDefaultGroups();
       await ensureMissingDefaultGroups();
+      await migrateRotaToInstant();
     })();
   }
   await seedPromise;
@@ -890,10 +914,6 @@ async function handleQueueDistribution(req, res, groupSlug) {
   }
 }
 
-async function handleRotaDistribution(req, res) {
-  return handleQueueDistribution(req, res, ROTA_GROUP);
-}
-
 //Routes
 app.get("/api/v1/health", async (req, res) => {
   const start = Date.now();
@@ -1215,7 +1235,7 @@ app.post("/api/v1/distribution/ef", (req, res) =>
   handleDistribution(req, res, "ef"),
 );
 app.post("/api/v1/distribution/rota", (req, res) =>
-  handleRotaDistribution(req, res),
+  handleDistribution(req, res, "rota"),
 );
 app.post("/api/v1/distribution/purificador", (req, res) =>
   handleQueueDistribution(req, res, "purificador"),
