@@ -648,6 +648,7 @@ async function processGroupQueue(groupSlug) {
     console.warn(
       `[distribution/${groupSlug}] Fila ocupada, reprocessamento agendado.`,
     );
+    scheduleBackgroundWork(processGroupQueue(groupSlug));
     return;
   }
 
@@ -657,7 +658,7 @@ async function processGroupQueue(groupSlug) {
       ?? 1000,
   );
   const staleMs = Number(process.env.DISTRIBUTION_STALE_JOB_MS ?? 120000);
-  const maxJobs = Number(process.env.DISTRIBUTION_MAX_JOBS_PER_RUN ?? 20);
+  const maxJobs = Number(process.env.DISTRIBUTION_MAX_JOBS_PER_RUN ?? 12);
 
   try {
     const staleCutoff = new Date(Date.now() - staleMs);
@@ -723,14 +724,12 @@ async function processGroupQueue(groupSlug) {
       await sleep(delayMs);
     }
 
-    if (processed >= maxJobs) {
-      const pendingCount = await DistributionJob.countDocuments({
-        group: groupSlug,
-        status: "pending",
-      });
-      if (pendingCount > 0) {
-        scheduleBackgroundWork(processGroupQueue(groupSlug));
-      }
+    const pendingRemaining = await DistributionJob.countDocuments({
+      group: groupSlug,
+      status: "pending",
+    });
+    if (pendingRemaining > 0) {
+      scheduleBackgroundWork(processGroupQueue(groupSlug));
     }
   } finally {
     await releaseQueueLock(groupSlug);
