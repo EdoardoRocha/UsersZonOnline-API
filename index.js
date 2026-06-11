@@ -616,7 +616,7 @@ async function acquireQueueLock(groupSlug) {
   const lockTtl = Number(
     process.env.DISTRIBUTION_QUEUE_LOCK_TTL_MS
       ?? process.env.ROTA_QUEUE_LOCK_TTL_MS
-      ?? 300000,
+      ?? 90000,
   );
   const now = new Date();
   const lockedUntil = new Date(now.getTime() + lockTtl);
@@ -643,13 +643,13 @@ async function releaseQueueLock(groupSlug) {
 }
 
 async function processGroupQueue(groupSlug) {
+  const startedAt = Date.now();
   const acquired = await acquireQueueLock(groupSlug);
   if (!acquired) {
-    console.warn(
-      `[distribution/${groupSlug}] Fila ocupada, reprocessamento agendado.`,
+    console.log(
+      `[distribution/${groupSlug}] Fila ocupada, aguardando cron ou outro worker.`,
     );
-    scheduleBackgroundWork(processGroupQueue(groupSlug));
-    return;
+    return { acquired: false, processed: 0, pendingRemaining: 0 };
   }
 
   const delayMs = Number(
@@ -658,7 +658,9 @@ async function processGroupQueue(groupSlug) {
       ?? 1000,
   );
   const staleMs = Number(process.env.DISTRIBUTION_STALE_JOB_MS ?? 120000);
-  const maxJobs = Number(process.env.DISTRIBUTION_MAX_JOBS_PER_RUN ?? 12);
+  const maxJobs = Number(process.env.DISTRIBUTION_MAX_JOBS_PER_RUN ?? 10);
+
+  let processed = 0;
 
   try {
     const staleCutoff = new Date(Date.now() - staleMs);
@@ -675,8 +677,6 @@ async function processGroupQueue(groupSlug) {
         `[distribution/${groupSlug}] ${resetResult.modifiedCount} job(s) preso(s) resetado(s) para pending.`,
       );
     }
-
-    let processed = 0;
 
     while (processed < maxJobs) {
       const job = await DistributionJob.findOneAndUpdate(
@@ -728,12 +728,47 @@ async function processGroupQueue(groupSlug) {
       group: groupSlug,
       status: "pending",
     });
-    if (pendingRemaining > 0) {
-      scheduleBackgroundWork(processGroupQueue(groupSlug));
-    }
+    const elapsedMs = Date.now() - startedAt;
+    console.log(
+      `[distribution/${groupSlug}] Batch concluído: ${processed} job(s), ${pendingRemaining} pendente(s), ${elapsedMs}ms.`,
+    );
+    return { acquired: true, processed, pendingRemaining, elapsedMs };
   } finally {
     await releaseQueueLock(groupSlug);
   }
+}
+
+async function getGroupsWithPendingJobs() {
+  return DistributionJob.distinct("group", { status: "pending" });
+}
+
+async function processAllPendingQueues() {
+  const groups = await getGroupsWithPendingJobs();
+  const results = [];
+
+  for (const groupSlug of groups) {
+    results.push({
+      groupSlug,
+      ...(await processGroupQueue(groupSlug)),
+    });
+  }
+
+  return results;
+}
+
+function isAuthorizedCronRequest(req) {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) {
+    if (process.env.VERCEL) {
+      console.warn("[cron] CRON_SECRET não configurado na Vercel.");
+      return false;
+    }
+    return true;
+  }
+
+  const auth = req.headers.authorization ?? "";
+  const headerSecret = req.headers["x-cron-secret"] ?? "";
+  return auth === `Bearer ${secret}` || headerSecret === secret;
 }
 
 async function enqueueGroupLead(leadId, groupSlug) {
@@ -798,6 +833,27 @@ async function handleQueueDistribution(req, res, groupSlug) {
 }
 
 //Routes
+app.get("/api/cron/process-queues", async (req, res) => {
+  if (!isAuthorizedCronRequest(req)) {
+    return res.status(401).json({ message: "Não autorizado." });
+  }
+
+  const cronStartedAt = Date.now();
+
+  try {
+    const results = await processAllPendingQueues();
+    const elapsedMs = Date.now() - cronStartedAt;
+    return res.status(200).json({
+      message: "Filas processadas.",
+      elapsedMs,
+      results,
+    });
+  } catch (error) {
+    console.error("[cron/process-queues]", error);
+    return res.status(500).json({ message: error.message });
+  }
+});
+
 app.get("/api/v1/health", async (req, res) => {
   const start = Date.now();
 
