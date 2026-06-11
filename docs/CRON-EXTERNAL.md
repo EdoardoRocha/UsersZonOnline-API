@@ -45,7 +45,7 @@ curl -s -H "Authorization: Bearer SEU_CRON_SECRET" \
 Resposta esperada:
 
 ```json
-{
+{ 
   "message": "Filas processadas.",
   "elapsedMs": 12345,
   "results": [

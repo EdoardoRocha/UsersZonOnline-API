@@ -240,10 +240,14 @@ const DistributionState = mongoose.model(
 
 const DistributionLock = mongoose.model(
   "DistributionLock",
-  new Schema({
-    _id: { type: String, required: true },
-    lockedUntil: { type: Date, default: () => new Date(0) },
-  }),
+  new Schema(
+    {
+      _id: { type: String, required: true },
+      lockedUntil: { type: Date, default: () => new Date(0) },
+      lockedAt: { type: Date },
+    },
+    { timestamps: true },
+  ),
 );
 
 const PluginGroup = mongoose.model(
@@ -611,6 +615,13 @@ async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer
   return { success: false, error: message };
 }
 
+function getApiBaseUrl() {
+  if (process.env.VERCEL_URL) {
+    return `https://${process.env.VERCEL_URL}`;
+  }
+  return `http://127.0.0.1:${process.env.PORT ?? 3000}`;
+}
+
 async function acquireQueueLock(groupSlug) {
   const lockId = `${groupSlug}-processor`;
   const lockTtl = Number(
@@ -618,6 +629,7 @@ async function acquireQueueLock(groupSlug) {
       ?? process.env.ROTA_QUEUE_LOCK_TTL_MS
       ?? 90000,
   );
+  const maxHoldMs = Number(process.env.DISTRIBUTION_MAX_LOCK_HOLD_MS ?? 75000);
   const now = new Date();
   const lockedUntil = new Date(now.getTime() + lockTtl);
 
@@ -627,29 +639,72 @@ async function acquireQueueLock(groupSlug) {
     { upsert: true },
   );
 
+  const existingLock = await DistributionLock.findById(lockId);
+  if (existingLock?.lockedUntil > now) {
+    const heldSince = existingLock.lockedAt ?? existingLock.updatedAt;
+    const heldForMs = heldSince
+      ? now.getTime() - new Date(heldSince).getTime()
+      : maxHoldMs + 1;
+    if (heldForMs > maxHoldMs) {
+      console.warn(
+        `[distribution/${groupSlug}] Lock preso há ${heldForMs}ms, forçando liberação.`,
+      );
+      await DistributionLock.findByIdAndUpdate(lockId, {
+        $set: { lockedUntil: new Date(0), lockedAt: null },
+      });
+    }
+  }
+
+  const acquireNow = new Date();
   const acquired = await DistributionLock.findOneAndUpdate(
-    { _id: lockId, lockedUntil: { $lte: now } },
-    { $set: { lockedUntil } },
+    { _id: lockId, lockedUntil: { $lte: acquireNow } },
+    {
+      $set: {
+        lockedUntil: new Date(acquireNow.getTime() + lockTtl),
+        lockedAt: acquireNow,
+      },
+    },
     { returnDocument: "after" },
   );
 
-  return !!acquired;
+  return { acquired: !!acquired, lockState: existingLock };
 }
 
 async function releaseQueueLock(groupSlug) {
   await DistributionLock.findByIdAndUpdate(`${groupSlug}-processor`, {
-    $set: { lockedUntil: new Date(0) },
+    $set: { lockedUntil: new Date(0), lockedAt: null },
   });
+}
+
+async function triggerQueueProcessing() {
+  const base = getApiBaseUrl();
+  const headers = {};
+  const secret = process.env.CRON_SECRET;
+  if (secret) {
+    headers.Authorization = `Bearer ${secret}`;
+  }
+
+  const response = await fetch(`${base}/api/cron/process-queues`, { headers });
+  const body = await response.json().catch(() => ({}));
+  return { status: response.status, body };
 }
 
 async function processGroupQueue(groupSlug) {
   const startedAt = Date.now();
-  const acquired = await acquireQueueLock(groupSlug);
+  const pendingAtStart = await DistributionJob.countDocuments({
+    group: groupSlug,
+    status: "pending",
+  });
+  const { acquired, lockState } = await acquireQueueLock(groupSlug);
   if (!acquired) {
+    const lockUntil = lockState?.lockedUntil?.toISOString() ?? null;
     console.log(
       `[distribution/${groupSlug}] Fila ocupada, aguardando cron ou outro worker.`,
     );
-    return { acquired: false, processed: 0, pendingRemaining: 0 };
+    // #region agent log
+    fetch("http://127.0.0.1:7880/ingest/86e94e1a-50d8-4401-b3cf-06525982f660", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "53b481" }, body: JSON.stringify({ sessionId: "53b481", runId: "dist-debug", hypothesisId: "A", location: "index.js:processGroupQueue:lockBusy", message: "lock not acquired", data: { groupSlug, pendingAtStart, lockUntil, lockedAt: lockState?.lockedAt?.toISOString() ?? null }, timestamp: Date.now() }) }).catch(() => {});
+    // #endregion
+    return { acquired: false, processed: 0, pendingRemaining: pendingAtStart };
   }
 
   const delayMs = Number(
@@ -732,6 +787,9 @@ async function processGroupQueue(groupSlug) {
     console.log(
       `[distribution/${groupSlug}] Batch concluído: ${processed} job(s), ${pendingRemaining} pendente(s), ${elapsedMs}ms.`,
     );
+    // #region agent log
+    fetch("http://127.0.0.1:7880/ingest/86e94e1a-50d8-4401-b3cf-06525982f660", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "53b481" }, body: JSON.stringify({ sessionId: "53b481", runId: "dist-debug", hypothesisId: "C", location: "index.js:processGroupQueue:batchDone", message: "batch completed", data: { groupSlug, processed, pendingAtStart, pendingRemaining, elapsedMs }, timestamp: Date.now() }) }).catch(() => {});
+    // #endregion
     return { acquired: true, processed, pendingRemaining, elapsedMs };
   } finally {
     await releaseQueueLock(groupSlug);
@@ -819,7 +877,31 @@ async function handleQueueDistribution(req, res, groupSlug) {
   try {
     const { duplicate } = await enqueueGroupLead(leadData.id, groupSlug);
 
-    scheduleBackgroundWork(processGroupQueue(groupSlug));
+    scheduleBackgroundWork(
+      triggerQueueProcessing()
+        .then((triggerResult) => {
+          // #region agent log
+          fetch("http://127.0.0.1:7880/ingest/86e94e1a-50d8-4401-b3cf-06525982f660", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "53b481" }, body: JSON.stringify({ sessionId: "53b481", runId: "dist-debug", hypothesisId: "B", location: "index.js:handleQueueDistribution:trigger", message: "queue trigger finished", data: { groupSlug, leadId: leadData.id, duplicate, triggerStatus: triggerResult.status, triggerBody: triggerResult.body }, timestamp: Date.now() }) }).catch(() => {});
+          // #endregion
+          if (triggerResult.status === 401) {
+            console.warn(
+              `[distribution/${groupSlug}] CRON_SECRET ausente ou inválido; processando batch local.`,
+            );
+            return processGroupQueue(groupSlug);
+          }
+          if (triggerResult.status >= 500) {
+            return processGroupQueue(groupSlug);
+          }
+          return triggerResult;
+        })
+        .catch((err) => {
+          console.error(
+            `[distribution/${groupSlug}] Falha ao acionar processador:`,
+            err.message,
+          );
+          return processGroupQueue(groupSlug);
+        }),
+    );
 
     return res.status(200).json({
       message: duplicate
@@ -843,6 +925,9 @@ app.get("/api/cron/process-queues", async (req, res) => {
   try {
     const results = await processAllPendingQueues();
     const elapsedMs = Date.now() - cronStartedAt;
+    // #region agent log
+    fetch("http://127.0.0.1:7880/ingest/86e94e1a-50d8-4401-b3cf-06525982f660", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "53b481" }, body: JSON.stringify({ sessionId: "53b481", runId: "dist-debug", hypothesisId: "B", location: "index.js:cron:done", message: "cron finished", data: { results, elapsedMs, hasCronSecret: !!process.env.CRON_SECRET }, timestamp: Date.now() }) }).catch(() => {});
+    // #endregion
     return res.status(200).json({
       message: "Filas processadas.",
       elapsedMs,
