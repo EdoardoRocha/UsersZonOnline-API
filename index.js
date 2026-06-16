@@ -274,6 +274,186 @@ const PluginGroup = mongoose.model(
   ),
 );
 
+const PresenceGrace = mongoose.model(
+  "PresenceGrace",
+  new Schema(
+    {
+      userId: { type: String, required: true, unique: true, index: true },
+      kommoTabOnline: { type: Boolean, default: false },
+      graceExpiresAt: { type: Date, default: null, index: true },
+      lastEventAt: { type: Date, default: () => new Date() },
+    },
+    { timestamps: true },
+  ),
+);
+
+function getAbsenceGraceMs() {
+  return Number(process.env.ABSENCE_GRACE_MS ?? 600000);
+}
+
+async function applyRoutingStatus(userId, name, status, group) {
+  const _id = String(userId);
+
+  const update =
+    status === "online"
+      ? {
+        $addToSet: { groups: group },
+        $set: { name, status: "online" },
+      }
+      : {
+        $pull: { groups: group },
+        $set: { name },
+      };
+
+  let usuarioAtualizado = await OnlineUser.findOneAndUpdate({ _id }, update, {
+    upsert: status === "online",
+    returnDocument: "after",
+    runValidators: true,
+  });
+
+  if (status === "offline" && usuarioAtualizado) {
+    const isStillOnline = usuarioAtualizado.groups.length > 0;
+    if (!isStillOnline) {
+      usuarioAtualizado = await OnlineUser.findOneAndUpdate(
+        { _id },
+        { status: "offline" },
+        { returnDocument: "after", runValidators: true },
+      );
+    }
+  }
+
+  return usuarioAtualizado;
+}
+
+async function getMemberGroupsForUser(userId) {
+  const uid = String(userId);
+  const groups = await PluginGroup.find({ active: true, "members.userId": uid });
+
+  return groups.map((g) => {
+    const member = g.members.find((m) => m.userId === uid);
+    return { slug: g.slug, name: member?.name ?? uid };
+  });
+}
+
+async function applyRoutingOnlineAllGroups(userId) {
+  const memberships = await getMemberGroupsForUser(userId);
+  if (!memberships.length) {
+    return { updated: false, groups: [] };
+  }
+
+  let usuarioAtualizado = null;
+  for (const { slug, name } of memberships) {
+    usuarioAtualizado = await applyRoutingStatus(userId, name, "online", slug);
+  }
+
+  await PresenceGrace.findOneAndUpdate(
+    { userId: String(userId) },
+    {
+      $set: {
+        kommoTabOnline: true,
+        graceExpiresAt: null,
+        lastEventAt: new Date(),
+      },
+    },
+    { upsert: true },
+  );
+
+  return {
+    updated: true,
+    groups: memberships.map((m) => m.slug),
+    user: usuarioAtualizado,
+  };
+}
+
+async function applyRoutingOfflineAllGroups(userId) {
+  const uid = String(userId);
+  const user = await OnlineUser.findById(uid);
+
+  if (!user || user.status !== "online" || !user.groups?.length) {
+    return { updated: false, groups: [] };
+  }
+
+  const groupsAffected = [...user.groups];
+  let usuarioAtualizado = user;
+
+  for (const groupSlug of groupsAffected) {
+    usuarioAtualizado = await applyRoutingStatus(
+      uid,
+      user.name ?? uid,
+      "offline",
+      groupSlug,
+    );
+  }
+
+  return {
+    updated: true,
+    groups: groupsAffected,
+    user: usuarioAtualizado,
+  };
+}
+
+async function handleKommoPresenceOffline(userId) {
+  const uid = String(userId);
+  const now = new Date();
+  const routingUser = await OnlineUser.findById(uid);
+
+  const graceUpdate = {
+    kommoTabOnline: false,
+    lastEventAt: now,
+    graceExpiresAt: null,
+  };
+
+  if (routingUser?.status === "online") {
+    graceUpdate.graceExpiresAt = new Date(now.getTime() + getAbsenceGraceMs());
+  }
+
+  await PresenceGrace.findOneAndUpdate(
+    { userId: uid },
+    { $set: graceUpdate },
+    { upsert: true },
+  );
+
+  return {
+    graceStarted: !!graceUpdate.graceExpiresAt,
+    graceExpiresAt: graceUpdate.graceExpiresAt,
+  };
+}
+
+async function processAbsenceTimeouts() {
+  const now = new Date();
+  const expired = await PresenceGrace.find({
+    graceExpiresAt: { $ne: null, $lte: now },
+  });
+
+  const results = [];
+
+  for (const grace of expired) {
+    const user = await OnlineUser.findById(grace.userId);
+    let outcome = { userId: grace.userId, action: "skipped" };
+
+    if (user?.status === "online") {
+      const offlineResult = await applyRoutingOfflineAllGroups(grace.userId);
+      outcome = {
+        userId: grace.userId,
+        action: "offline",
+        groups: offlineResult.groups,
+      };
+      console.log(
+        `[absence] Usuário ${grace.userId} offline após grace. Grupos: ${offlineResult.groups.join(", ") || "nenhum"}`,
+      );
+    }
+
+    await PresenceGrace.findOneAndUpdate(
+      { userId: grace.userId },
+      { $set: { graceExpiresAt: null, kommoTabOnline: false } },
+    );
+
+    results.push(outcome);
+  }
+
+  return results;
+}
+
 async function seedDefaultGroups() {
   const count = await PluginGroup.countDocuments();
   if (count > 0) return;
@@ -829,6 +1009,21 @@ function isAuthorizedCronRequest(req) {
   return auth === `Bearer ${secret}` || headerSecret === secret;
 }
 
+function isAuthorizedKommoPresenceRequest(req) {
+  const secret = process.env.KOMMO_PRESENCE_SECRET;
+  if (!secret) {
+    if (process.env.VERCEL) {
+      console.warn("[kommo-presence] KOMMO_PRESENCE_SECRET não configurado.");
+      return false;
+    }
+    return true;
+  }
+
+  const auth = req.headers.authorization ?? "";
+  const headerSecret = req.headers["x-kommo-presence-secret"] ?? "";
+  return auth === `Bearer ${secret}` || headerSecret === secret;
+}
+
 async function enqueueGroupLead(leadId, groupSlug) {
   try {
     await DistributionJob.create({
@@ -939,6 +1134,27 @@ app.get("/api/cron/process-queues", async (req, res) => {
   }
 });
 
+app.get("/api/cron/process-absence", async (req, res) => {
+  if (!isAuthorizedCronRequest(req)) {
+    return res.status(401).json({ message: "Não autorizado." });
+  }
+
+  const startedAt = Date.now();
+
+  try {
+    const results = await processAbsenceTimeouts();
+    return res.status(200).json({
+      message: "Ausências processadas.",
+      elapsedMs: Date.now() - startedAt,
+      processed: results.length,
+      results,
+    });
+  } catch (error) {
+    console.error("[cron/process-absence]", error);
+    return res.status(500).json({ message: error.message });
+  }
+});
+
 app.get("/api/v1/health", async (req, res) => {
   const start = Date.now();
 
@@ -974,6 +1190,36 @@ app.get("/api/v1/health", async (req, res) => {
   }
 });
 
+app.post("/api/v1/kommo-presence", async (req, res) => {
+  if (!isAuthorizedKommoPresenceRequest(req)) {
+    return res.status(401).json({ message: "Não autorizado." });
+  }
+
+  const { userId, status } = req.body;
+
+  if (!isValidKommoUserId(String(userId ?? ""))) {
+    return res.status(400).json({ message: "Campo 'userId' inválido." });
+  }
+
+  if (!["online", "offline"].includes(status)) {
+    return res.status(400).json({
+      message: "Campo 'status' inválido. Use 'online' ou 'offline'.",
+    });
+  }
+
+  try {
+    const result =
+      status === "online"
+        ? await applyRoutingOnlineAllGroups(userId)
+        : await handleKommoPresenceOffline(userId);
+
+    return res.status(200).json({ message: "OK", data: result });
+  } catch (error) {
+    console.error("[kommo-presence]", error);
+    return res.status(500).json({ message: error.message });
+  }
+});
+
 app.post("/api/v1/presence", async (req, res) => {
   const { _id, name, status, group } = req.body;
 
@@ -990,32 +1236,24 @@ app.post("/api/v1/presence", async (req, res) => {
   }
 
   try {
-    const update =
-      status === "online"
-        ? {
-          $addToSet: { groups: group },
-          $set: { name, status: "online" },
-        }
-        : {
-          $pull: { groups: group },
-          $set: { name },
-        };
+    const usuarioAtualizado = await applyRoutingStatus(_id, name, status, group);
 
-    let usuarioAtualizado = await OnlineUser.findOneAndUpdate({ _id }, update, {
-      upsert: status === "online",
-      returnDocument: "after",
-      runValidators: true,
-    });
-
-    if (status === "offline" && usuarioAtualizado) {
-      const isStillOnline = usuarioAtualizado.groups.length > 0;
-      if (!isStillOnline) {
-        usuarioAtualizado = await OnlineUser.findOneAndUpdate(
-          { _id },
-          { status: "offline" },
-          { returnDocument: "after", runValidators: true },
-        );
-      }
+    if (status === "online") {
+      await PresenceGrace.findOneAndUpdate(
+        { userId: String(_id) },
+        {
+          $set: {
+            graceExpiresAt: null,
+            lastEventAt: new Date(),
+          },
+        },
+        { upsert: true },
+      );
+    } else {
+      await PresenceGrace.findOneAndUpdate(
+        { userId: String(_id) },
+        { $set: { graceExpiresAt: null, lastEventAt: new Date() } },
+      );
     }
 
     return res.status(200).json({
