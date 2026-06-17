@@ -36,6 +36,33 @@ const COMPOSITE_ROUTES = {
 
 const indexPointers = {};
 
+const DEFAULT_AUTOMATIC_PRESENCE_GROUP_SLUGS = [
+  "digital",
+  "purificador",
+  "ef",
+  "sac",
+];
+
+function buildAutomaticPresenceGroupSlugs() {
+  const env = process.env.AUTOMATIC_PRESENCE_GROUPS;
+  if (env?.trim()) {
+    return new Set(
+      env.split(",").map((s) => s.trim()).filter(Boolean),
+    );
+  }
+  return new Set(DEFAULT_AUTOMATIC_PRESENCE_GROUP_SLUGS);
+}
+
+const AUTOMATIC_PRESENCE_GROUP_SLUGS = buildAutomaticPresenceGroupSlugs();
+
+function isAutomaticPresenceGroup(slug) {
+  return AUTOMATIC_PRESENCE_GROUP_SLUGS.has(slug);
+}
+
+function getUserAutomaticOnlineGroups(user) {
+  return (user?.groups ?? []).filter(isAutomaticPresenceGroup);
+}
+
 const DEFAULT_PLUGIN_GROUPS = [
   {
     slug: "digital",
@@ -335,11 +362,13 @@ async function getMemberGroupsForUser(userId) {
   });
 }
 
-async function applyRoutingOnlineAllGroups(userId) {
-  const memberships = await getMemberGroupsForUser(userId);
-  if (!memberships.length) {
-    return { updated: false, groups: [] };
-  }
+async function getAutomaticMemberGroupsForUser(userId) {
+  const all = await getMemberGroupsForUser(userId);
+  return all.filter((m) => isAutomaticPresenceGroup(m.slug));
+}
+
+async function applyRoutingOnlineAutomaticGroups(userId) {
+  const memberships = await getAutomaticMemberGroupsForUser(userId);
 
   let usuarioAtualizado = null;
   for (const { slug, name } of memberships) {
@@ -359,21 +388,25 @@ async function applyRoutingOnlineAllGroups(userId) {
   );
 
   return {
-    updated: true,
+    updated: memberships.length > 0,
     groups: memberships.map((m) => m.slug),
     user: usuarioAtualizado,
   };
 }
 
-async function applyRoutingOfflineAllGroups(userId) {
+async function applyRoutingOfflineAutomaticGroups(userId) {
   const uid = String(userId);
   const user = await OnlineUser.findById(uid);
 
-  if (!user || user.status !== "online" || !user.groups?.length) {
+  if (!user || user.status !== "online") {
     return { updated: false, groups: [] };
   }
 
-  const groupsAffected = [...user.groups];
+  const groupsAffected = getUserAutomaticOnlineGroups(user);
+  if (!groupsAffected.length) {
+    return { updated: false, groups: [] };
+  }
+
   let usuarioAtualizado = user;
 
   for (const groupSlug of groupsAffected) {
@@ -403,7 +436,7 @@ async function handleKommoPresenceOffline(userId) {
     graceExpiresAt: null,
   };
 
-  if (routingUser?.status === "online") {
+  if (getUserAutomaticOnlineGroups(routingUser).length > 0) {
     graceUpdate.graceExpiresAt = new Date(now.getTime() + getAbsenceGraceMs());
   }
 
@@ -432,15 +465,17 @@ async function processAbsenceTimeouts() {
     let outcome = { userId: grace.userId, action: "skipped" };
 
     if (user?.status === "online") {
-      const offlineResult = await applyRoutingOfflineAllGroups(grace.userId);
-      outcome = {
-        userId: grace.userId,
-        action: "offline",
-        groups: offlineResult.groups,
-      };
-      console.log(
-        `[absence] Usuário ${grace.userId} offline após grace. Grupos: ${offlineResult.groups.join(", ") || "nenhum"}`,
-      );
+      const offlineResult = await applyRoutingOfflineAutomaticGroups(grace.userId);
+      if (offlineResult.updated) {
+        outcome = {
+          userId: grace.userId,
+          action: "offline",
+          groups: offlineResult.groups,
+        };
+        console.log(
+          `[absence] Usuário ${grace.userId} offline após grace. Grupos automáticos: ${offlineResult.groups.join(", ")}`,
+        );
+      }
     }
 
     await PresenceGrace.findOneAndUpdate(
@@ -1210,7 +1245,7 @@ app.post("/api/v1/kommo-presence", async (req, res) => {
   try {
     const result =
       status === "online"
-        ? await applyRoutingOnlineAllGroups(userId)
+        ? await applyRoutingOnlineAutomaticGroups(userId)
         : await handleKommoPresenceOffline(userId);
 
     return res.status(200).json({ message: "OK", data: result });

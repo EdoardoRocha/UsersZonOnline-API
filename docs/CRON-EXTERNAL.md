@@ -113,6 +113,18 @@ O `vercel.json` inclui um cron **diário** às 06:00 UTC (`0 6 * * *`) como rede
 | `DISTRIBUTION_STALE_JOB_MS` | `120000` | Jobs `processing` presos voltam para `pending` |
 | `ABSENCE_GRACE_MS` | `600000` | Grace period (10 min) antes do offline automático na API |
 
+## Presença automática vs manual
+
+Grupos com status controlado pelo WebSocket (extensão KommoOnlineUsers → `POST /api/v1/kommo-presence`):
+
+- `digital`, `purificador`, `ef` (Elemento filtrante), `sac`
+
+Grupos com status **somente manual** (plugin KommoSellerStatus → `POST /api/v1/presence`):
+
+- `rota`, `pos-venda`, `vipzon` e demais
+
+Override opcional na Vercel: `AUTOMATIC_PRESENCE_GROUPS=digital,purificador,ef,sac`
+
 ## Extensão KommoOnlineUsers
 
 Configure o mesmo valor de `KOMMO_PRESENCE_SECRET` na extensão:
