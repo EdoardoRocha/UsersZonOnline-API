@@ -18,7 +18,7 @@ No plano **Hobby**, a Vercel só permite cron **1x por dia**. Para drenar a fila
 ## 2. Configurar cron-job.org (recomendado)
 
 1. Crie conta em [cron-job.org](https://cron-job.org) (grátis)
-2. Crie **dois** cronjobs:
+2. Crie **três** cronjobs:
 
 ### Job 1 — Processar filas de distribuição
 
@@ -37,6 +37,17 @@ No plano **Hobby**, a Vercel só permite cron **1x por dia**. Para drenar a fila
 | URL | `https://userszon-status-api.vercel.app/api/cron/process-absence` |
 | Schedule | Every **1 minute** |
 | Request method | `GET` |
+
+### Job 3 — Reconciliar filas (recomendado)
+
+| Campo | Valor |
+|-------|-------|
+| Title | UsersZon - Reconciliar filas ROTA |
+| URL | `https://userszon-status-api.vercel.app/api/cron/reconcile-queues?group=rota` |
+| Schedule | Every **5 minutes** |
+| Request method | `GET` |
+
+Reativa jobs `failed` por falta de usuário online e alerta se há pendências com vendedores disponíveis.
 
 3. Em **Advanced** → **Headers** de cada job, adicione:
 
@@ -108,10 +119,49 @@ O `vercel.json` inclui um cron **diário** às 06:00 UTC (`0 6 * * *`) como rede
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
 | `DISTRIBUTION_DELAY_MS` | `1000` | Delay entre leads (evita 429 no Kommo) |
-| `DISTRIBUTION_MAX_JOBS_PER_RUN` | `10` | Jobs por invocação (cabe em 60s no Hobby) |
+| `DISTRIBUTION_MAX_JOBS_PER_RUN` | `10` | Jobs por batch dentro de cada drenagem (recomendado `25` na Vercel para bursts) |
 | `DISTRIBUTION_QUEUE_LOCK_TTL_MS` | `90000` | TTL do lock da fila |
 | `DISTRIBUTION_STALE_JOB_MS` | `120000` | Jobs `processing` presos voltam para `pending` |
 | `ABSENCE_GRACE_MS` | `600000` | Grace period (10 min) antes do offline automático na API |
+
+## Observabilidade da fila
+
+Consulte o estado da fila em tempo real:
+
+```bash
+curl -s https://userszon-status-api.vercel.app/api/v1/distribution/rota/queue
+```
+
+Resposta esperada:
+
+```json
+{
+  "group": "rota",
+  "pending": 0,
+  "processing": 0,
+  "failed": 0,
+  "doneLast24h": 120,
+  "onlineUsers": ["14107476", "14107552"],
+  "oldestPendingAgeMs": null,
+  "oldestPendingLeadId": null
+}
+```
+
+## Recuperação de leads não distribuídos
+
+Para leads que ficaram com responsável errado no Kommo:
+
+```bash
+LEAD_IDS=93001,93002,93003 CRON_SECRET=seu_secret node scripts/recover-rota-leads.mjs
+```
+
+O script reconcilia jobs `failed`, re-enfileira os leads e dispara o cron de processamento.
+
+## Teste de burst (28 leads)
+
+```bash
+CRON_SECRET=seu_secret BURST_SIZE=28 node scripts/test-production.mjs
+```
 
 ## Presença automática vs manual
 

@@ -179,8 +179,14 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function extractLeadsFromBody(body) {
+  if (body.leads?.add?.length) return body.leads.add;
+  if (body.leads?.status?.length) return body.leads.status;
+  return [];
+}
+
 function extractLeadFromBody(body) {
-  return body.leads?.add?.[0] || body.leads?.status?.[0];
+  return extractLeadsFromBody(body)[0] ?? null;
 }
 
 function getCompositeRoute(slug) {
@@ -245,6 +251,8 @@ const distributionJobSchema = new Schema(
     },
     assignedTo: { type: String },
     error: { type: String },
+    attemptCount: { type: Number, default: 0 },
+    lastAttemptAt: { type: Date },
   },
   { timestamps: true },
 );
@@ -256,6 +264,9 @@ distributionJobSchema.index(
 );
 
 const DistributionJob = mongoose.model("DistributionJob", distributionJobSchema);
+
+const NO_USERS_ONLINE_ERROR_PREFIX = "Nenhum usuário online";
+const drainInProgress = new Map();
 
 const DistributionState = mongoose.model(
   "DistributionState",
@@ -830,13 +841,6 @@ async function assignLeadInKommo(leadId, groupSlug, validUsers, useAtomicPointer
   return { success: false, error: message };
 }
 
-function getApiBaseUrl() {
-  if (process.env.VERCEL_URL) {
-    return `https://${process.env.VERCEL_URL}`;
-  }
-  return `http://127.0.0.1:${process.env.PORT ?? 3000}`;
-}
-
 async function acquireQueueLock(groupSlug) {
   const lockId = `${groupSlug}-processor`;
   const lockTtl = Number(
@@ -889,19 +893,6 @@ async function releaseQueueLock(groupSlug) {
   await DistributionLock.findByIdAndUpdate(`${groupSlug}-processor`, {
     $set: { lockedUntil: new Date(0), lockedAt: null },
   });
-}
-
-async function triggerQueueProcessing() {
-  const base = getApiBaseUrl();
-  const headers = {};
-  const secret = process.env.CRON_SECRET;
-  if (secret) {
-    headers.Authorization = `Bearer ${secret}`;
-  }
-
-  const response = await fetch(`${base}/api/cron/process-queues`, { headers });
-  const body = await response.json().catch(() => ({}));
-  return { status: response.status, body };
 }
 
 async function processGroupQueue(groupSlug) {
@@ -963,11 +954,17 @@ async function processGroupQueue(groupSlug) {
         if (!validUsers.length) {
           const errorMsg = getNoUsersOnlineMessage(groupSlug);
           await DistributionJob.findByIdAndUpdate(job._id, {
-            $set: { status: "failed", error: errorMsg },
+            $set: {
+              status: "pending",
+              error: errorMsg,
+              lastAttemptAt: new Date(),
+            },
+            $inc: { attemptCount: 1 },
           });
-          processed++;
-          await sleep(delayMs);
-          continue;
+          console.warn(
+            `[distribution/${groupSlug}] Nenhum online — lead ${job.leadId} reagendado.`,
+          );
+          break;
         }
 
         const result = await assignLeadInKommo(
@@ -1011,6 +1008,163 @@ async function processGroupQueue(groupSlug) {
   }
 }
 
+async function drainGroupQueue(groupSlug, maxElapsedMs = 55000) {
+  const existing = drainInProgress.get(groupSlug);
+  if (existing) {
+    return existing;
+  }
+
+  const drainPromise = (async () => {
+    const startedAt = Date.now();
+    const deadline = startedAt + maxElapsedMs;
+    let totalProcessed = 0;
+    let pendingRemaining = 0;
+    let stoppedReason = "empty";
+    let batches = 0;
+
+    while (Date.now() < deadline) {
+      const result = await processGroupQueue(groupSlug);
+      batches++;
+
+      if (!result.acquired) {
+        if (Date.now() + 500 >= deadline) {
+          stoppedReason = "deadline";
+          pendingRemaining = result.pendingRemaining ?? pendingRemaining;
+          break;
+        }
+        await sleep(500);
+        continue;
+      }
+
+      totalProcessed += result.processed;
+      pendingRemaining = result.pendingRemaining;
+
+      if (pendingRemaining === 0) {
+        stoppedReason = "empty";
+        break;
+      }
+
+      if (result.processed === 0 && pendingRemaining > 0) {
+        stoppedReason = "no_online";
+        break;
+      }
+    }
+
+    if (Date.now() >= deadline && pendingRemaining > 0 && stoppedReason === "empty") {
+      stoppedReason = "deadline";
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+    console.log(
+      `[distribution/${groupSlug}] Drenagem concluída: ${totalProcessed} job(s), ${pendingRemaining} pendente(s), ${batches} batch(es), motivo=${stoppedReason}, ${elapsedMs}ms.`,
+    );
+
+    return {
+      acquired: true,
+      processed: totalProcessed,
+      pendingRemaining,
+      elapsedMs,
+      batches,
+      stoppedReason,
+    };
+  })()
+    .catch((err) => {
+      console.error(`[distribution/${groupSlug}] Erro na drenagem:`, err.message);
+      throw err;
+    })
+    .finally(() => {
+      drainInProgress.delete(groupSlug);
+    });
+
+  drainInProgress.set(groupSlug, drainPromise);
+  return drainPromise;
+}
+
+function scheduleDebouncedDrain(groupSlug) {
+  scheduleBackgroundWork(
+    drainGroupQueue(groupSlug).catch((err) => {
+      console.error(
+        `[distribution/${groupSlug}] Falha ao drenar fila em background:`,
+        err.message,
+      );
+    }),
+  );
+}
+
+async function getQueueStats(groupSlug) {
+  const dayAgo = new Date(Date.now() - 86400000);
+  const [pending, processing, failed, doneLast24h, oldestPending, validUsers] =
+    await Promise.all([
+      DistributionJob.countDocuments({ group: groupSlug, status: "pending" }),
+      DistributionJob.countDocuments({ group: groupSlug, status: "processing" }),
+      DistributionJob.countDocuments({ group: groupSlug, status: "failed" }),
+      DistributionJob.countDocuments({
+        group: groupSlug,
+        status: "done",
+        updatedAt: { $gte: dayAgo },
+      }),
+      DistributionJob.findOne({ group: groupSlug, status: "pending" })
+        .sort({ createdAt: 1 })
+        .select("createdAt leadId"),
+      getValidUsersForRoute(groupSlug),
+    ]);
+
+  return {
+    group: groupSlug,
+    pending,
+    processing,
+    failed,
+    doneLast24h,
+    onlineUsers: validUsers.map((u) => u._id),
+    oldestPendingAgeMs: oldestPending
+      ? Date.now() - oldestPending.createdAt.getTime()
+      : null,
+    oldestPendingLeadId: oldestPending?.leadId ?? null,
+  };
+}
+
+async function reconcileDistributionQueues(groupSlug = null) {
+  const filter = {
+    status: "failed",
+    error: { $regex: `^${NO_USERS_ONLINE_ERROR_PREFIX}` },
+  };
+  if (groupSlug) {
+    filter.group = groupSlug;
+  }
+
+  const resetResult = await DistributionJob.updateMany(filter, {
+    $set: { status: "pending", error: null },
+  });
+
+  const alerts = [];
+  const groups = groupSlug
+    ? [groupSlug]
+    : await DistributionJob.distinct("group", { status: "pending" });
+
+  for (const slug of groups) {
+    const pendingCount = await DistributionJob.countDocuments({
+      group: slug,
+      status: "pending",
+    });
+    if (pendingCount === 0) continue;
+
+    const validUsers = await getValidUsersForRoute(slug);
+    if (validUsers.length > 0) {
+      alerts.push({
+        group: slug,
+        pending: pendingCount,
+        onlineUsers: validUsers.map((u) => u._id),
+        message: `${pendingCount} job(s) pendente(s) com usuários online disponíveis`,
+      });
+    }
+  }
+
+  return {
+    resetCount: resetResult.modifiedCount,
+    alerts,
+  };
+}
+
 async function getGroupsWithPendingJobs() {
   return DistributionJob.distinct("group", { status: "pending" });
 }
@@ -1018,11 +1172,23 @@ async function getGroupsWithPendingJobs() {
 async function processAllPendingQueues() {
   const groups = await getGroupsWithPendingJobs();
   const results = [];
+  const deadline = Date.now() + 55000;
+  const perGroupMs = Math.max(
+    10000,
+    Math.floor((deadline - Date.now()) / Math.max(groups.length, 1)),
+  );
 
   for (const groupSlug of groups) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+
+    const drainResult = await drainGroupQueue(
+      groupSlug,
+      Math.min(perGroupMs, remainingMs),
+    );
     results.push({
       groupSlug,
-      ...(await processGroupQueue(groupSlug)),
+      ...drainResult,
     });
   }
 
@@ -1095,9 +1261,9 @@ app.use(async (req, res, next) => {
 });
 
 async function handleQueueDistribution(req, res, groupSlug) {
-  const leadData = extractLeadFromBody(req.body);
+  const leads = extractLeadsFromBody(req.body);
 
-  if (!leadData) {
+  if (!leads.length) {
     console.log("Webhook recebido, mas não está atrelado a um lead.");
     return res
       .status(200)
@@ -1105,38 +1271,32 @@ async function handleQueueDistribution(req, res, groupSlug) {
   }
 
   try {
-    const { duplicate } = await enqueueGroupLead(leadData.id, groupSlug);
+    const results = [];
+    for (const leadData of leads) {
+      if (!leadData?.id) continue;
+      const enqueueResult = await enqueueGroupLead(leadData.id, groupSlug);
+      results.push({ leadId: leadData.id, ...enqueueResult });
+    }
 
-    scheduleBackgroundWork(
-      triggerQueueProcessing()
-        .then((triggerResult) => {
-          // #region agent log
-          fetch("http://127.0.0.1:7880/ingest/86e94e1a-50d8-4401-b3cf-06525982f660", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "53b481" }, body: JSON.stringify({ sessionId: "53b481", runId: "dist-debug", hypothesisId: "B", location: "index.js:handleQueueDistribution:trigger", message: "queue trigger finished", data: { groupSlug, leadId: leadData.id, duplicate, triggerStatus: triggerResult.status, triggerBody: triggerResult.body }, timestamp: Date.now() }) }).catch(() => {});
-          // #endregion
-          if (triggerResult.status === 401) {
-            console.warn(
-              `[distribution/${groupSlug}] CRON_SECRET ausente ou inválido; processando batch local.`,
-            );
-            return processGroupQueue(groupSlug);
-          }
-          if (triggerResult.status >= 500) {
-            return processGroupQueue(groupSlug);
-          }
-          return triggerResult;
-        })
-        .catch((err) => {
-          console.error(
-            `[distribution/${groupSlug}] Falha ao acionar processador:`,
-            err.message,
-          );
-          return processGroupQueue(groupSlug);
-        }),
-    );
+    if (!results.length) {
+      return res.status(200).json({
+        message: "Ignorado: nenhum lead com id válido no payload.",
+      });
+    }
+
+    scheduleDebouncedDrain(groupSlug);
+
+    const enqueued = results.filter((r) => !r.duplicate).length;
+    const duplicates = results.filter((r) => r.duplicate).length;
 
     return res.status(200).json({
-      message: duplicate
-        ? "Lead já enfileirado para distribuição"
-        : "Lead enfileirado para distribuição",
+      message:
+        enqueued > 0
+          ? `${enqueued} lead(s) enfileirado(s) para distribuição`
+          : "Lead(s) já enfileirado(s) para distribuição",
+      enqueued,
+      duplicates,
+      leads: results,
     });
   } catch (error) {
     console.error(`[distribution/${groupSlug}] Erro ao enfileirar:`, error);
@@ -1186,6 +1346,36 @@ app.get("/api/cron/process-absence", async (req, res) => {
     });
   } catch (error) {
     console.error("[cron/process-absence]", error);
+    return res.status(500).json({ message: error.message });
+  }
+});
+
+app.get("/api/cron/reconcile-queues", async (req, res) => {
+  if (!isAuthorizedCronRequest(req)) {
+    return res.status(401).json({ message: "Não autorizado." });
+  }
+
+  const startedAt = Date.now();
+  const groupSlug = req.query.group?.trim() || null;
+
+  try {
+    const result = await reconcileDistributionQueues(groupSlug);
+
+    if (result.alerts.length > 0) {
+      console.warn(
+        "[cron/reconcile-queues] Alertas:",
+        JSON.stringify(result.alerts),
+      );
+    }
+
+    return res.status(200).json({
+      message: "Reconciliação concluída.",
+      group: groupSlug,
+      elapsedMs: Date.now() - startedAt,
+      ...result,
+    });
+  } catch (error) {
+    console.error("[cron/reconcile-queues]", error);
     return res.status(500).json({ message: error.message });
   }
 });
@@ -1513,6 +1703,22 @@ app.delete("/api/v1/groups/:slug/members/:userId", async (req, res) => {
 app.post("/api/v1/distribution/digital", (req, res) =>
   handleQueueDistribution(req, res, "digital"),
 );
+app.get("/api/v1/distribution/:groupSlug/queue", async (req, res) => {
+  const { groupSlug } = req.params;
+
+  try {
+    const composite = getCompositeRoute(groupSlug);
+    if (!composite && !(await groupExists(groupSlug))) {
+      return res.status(404).json({ message: "Grupo não encontrado." });
+    }
+
+    const stats = await getQueueStats(groupSlug);
+    return res.status(200).json(stats);
+  } catch (error) {
+    console.error(`[distribution/${groupSlug}/queue]`, error);
+    return res.status(500).json({ message: error.message });
+  }
+});
 app.post("/api/v1/distribution/vipzon", (req, res) =>
   handleQueueDistribution(req, res, "vipzon"),
 );
